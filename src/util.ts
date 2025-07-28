@@ -264,17 +264,58 @@ function getFieldSetter<TSection, TField extends keyof TSection>(
     ) => void;
 }
 
+const UNDEF_MARKER = { __YASM_SNAP_UNDEF__: true };
+
+function preEncode(value: unknown): unknown {
+    if (value === undefined) {
+        return UNDEF_MARKER;
+    }
+
+    if (Array.isArray(value)) {
+        return value.map(preEncode);
+    }
+
+    if (value && typeof value === 'object') {
+        const res: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(value)) {
+            res[k] = preEncode(v);
+        }
+        return res;
+    }
+
+    return value;
+}
+
+function postDecode(value: unknown): unknown {
+    if (Array.isArray(value)) {
+        return value.map(postDecode);
+    }
+
+    if (value && typeof value === 'object') {
+        if ((value as any).__YASM_SNAP_UNDEF__) return undefined;
+        const res: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(value)) {
+            res[k] = postDecode(v);
+        }
+        return res;
+    }
+
+    return value;
+}
+
 const snapshot = (obj: Record<string, unknown>, debugOptions: DebugOptions) => {
-    console.debug(
-        JSON.parse(
-            JSON.stringify(obj, function (key, value) {
-                return debugOptions.serializer
-                    ? debugOptions.serializer(this, key, value)
-                    : value;
-            }),
-            debugOptions.deserializer
-        )
-    );
+    const encoded = preEncode(obj);
+
+    const json = JSON.stringify(encoded, function (key, value) {
+        return debugOptions.serializer
+            ? debugOptions.serializer(this, key, value)
+            : value;
+    });
+
+    const parsed = JSON.parse(json, debugOptions.deserializer);
+    const restored = postDecode(parsed);
+
+    console.debug(restored);
 };
 
 export {
