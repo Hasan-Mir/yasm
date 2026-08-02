@@ -394,6 +394,7 @@ function postDecode(value: unknown): unknown {
 
     return value;
 }
+
 const snapshot = (obj: Record<string, unknown>, debugOptions: DebugOptions) => {
     const encoded = preEncode(obj);
 
@@ -409,9 +410,55 @@ const snapshot = (obj: Record<string, unknown>, debugOptions: DebugOptions) => {
     console.debug(restored);
 };
 
+/**
+ * Deeply freezes an object to prevent mutation in development environments.
+ * Handles circular references, avoids invoking getters, and includes symbols.
+ */
+const deepFreeze = <T>(
+    obj: T,
+    seen: WeakSet<object> = new WeakSet<object>()
+): T => {
+    // Base case: primitives and null
+    if (
+        obj === null ||
+        (typeof obj !== 'object' && typeof obj !== 'function')
+    ) {
+        return obj;
+    }
+
+    // Prevent infinite recursion on circular references
+    if (seen.has(obj)) {
+        return obj;
+    }
+    seen.add(obj);
+
+    // Use descriptors to safely traverse properties without invoking getters
+    const descriptors = Object.getOwnPropertyDescriptors(obj);
+
+    for (const key of Reflect.ownKeys(descriptors)) {
+        const descriptor = descriptors[key as keyof typeof descriptors];
+
+        // Only recurse if it's a standard value property (not a getter/setter)
+        if ('value' in descriptor) {
+            const value = descriptor.value;
+
+            // Recurse into nested objects and functions
+            if (
+                value !== null &&
+                (typeof value === 'object' || typeof value === 'function')
+            ) {
+                deepFreeze(value, seen);
+            }
+        }
+    }
+
+    return Object.freeze(obj);
+};
+
 export {
     immer,
     snapshot,
+    deepFreeze,
     isPathWithinPrefix,
     arraySectionGenerator,
     extractArrayIndexAndRemainedPathQuery,

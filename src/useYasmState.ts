@@ -1,5 +1,5 @@
 import { YasmContext } from './Context';
-import { immer, isPathWithinPrefix, snapshot } from './util';
+import { deepFreeze, immer, isPathWithinPrefix, snapshot } from './util';
 import { useContext, useSyncExternalStore } from 'react';
 import {
     Name,
@@ -147,10 +147,16 @@ const init = <SM extends Record<Name, Section>, N extends keyof SM>(
                       )(initialState)
                     : overrideInitialState;
 
-            state[routedName][routedPath] =
+            let finalInitialState =
                 override === undefined
                     ? initialState
                     : { ...initialState, ...override };
+
+            if (process.env.NODE_ENV !== 'production') {
+                deepFreeze(finalInitialState);
+            }
+
+            state[routedName][routedPath] = finalInitialState;
         }
 
         if (
