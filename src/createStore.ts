@@ -54,11 +54,59 @@ type Section<S = any, P = any> = {
 };
 
 type DebugOptions = {
+    /**
+     * When `true` (and `process.env.NODE_ENV !== 'production'`), YASM logs
+     * state changes during updates and purges.
+     *
+     * Note: Depending on your `snapshotScope` and
+     * `purgeSnapshotScope` settings, logging can serialize large parts of
+     * the store, which may cause performance overhead in development.
+     *
+     * @default false
+     */
+    logStateUpdates?: boolean;
+
+    /**
+     * Determines the scope of the state snapshot when `logStateUpdates` is enabled
+     * during state updates.
+     *
+     * - `'local'` (Default): Snapshots only the specific section and path being updated.
+     *   Highly recommended for performance, as it minimizes the serialization overhead.
+     * - `'full'`: Snapshots the entire global store state. Useful for debugging complex
+     *   issues where you need to see the complete application state, but may cause
+     *   significant performance overhead in large applications.
+     *
+     * @default 'local'
+     */
+    snapshotScope?: 'full' | 'local';
+
+    /**
+     * Determines the scope of the state snapshot when a `purge` operation occurs
+     * (and `logStateUpdates` is enabled).
+     *
+     * - `'none'` (Default): Logs a simple text confirmation without taking any
+     *   state snapshots. Highly recommended to maintain optimal performance.
+     * - `'full'`: Snapshots the entire global store state before and after the purge.
+     *   Useful for deep debugging but introduces heavy serialization overhead.
+     *
+     * @default 'none'
+     */
+    purgeSnapshotScope?: 'none' | 'full';
+
+    /**
+     * A custom serializer function used when generating state snapshots for logging.
+     * Useful for handling data types that do not natively serialize well (e.g., Date, BigInt, Decimal).
+     */
     serializer?: (
         object: Record<string, unknown>,
         key: string,
         value: unknown
     ) => any;
+
+    /**
+     * A custom deserializer function used when parsing state snapshots.
+     * Pairs with the `serializer` to reconstruct complex data types from the log output.
+     */
     deserializer?: (key: string, value: string) => any;
 };
 
@@ -71,14 +119,37 @@ type Store<SM extends Record<Name, Section> = Record<Name, Section>> = {
     routingPlan: RoutingPlan<SM>;
     memo: Memo<SM>;
     debugOptions: DebugOptions;
+    /**
+     * Characters that mark the start of a new segment inside a YASM path,
+     * e.g. `/tabs/1` (`/`), `/table[3]` (`[`), `/form.field` (`.`).
+     */
+    pathBoundaryChars: string[];
+};
+
+const DEFAULT_PATH_BOUNDARY_CHARS = ['/', '[', '.'];
+
+type StoreOptions = {
+    debugOptions?: DebugOptions;
+
+    /**
+     * Characters that mark the start of a new segment inside a YASM path,
+     * e.g. `/tabs/1` (`/`), `/table[3]` (`[`), `/form.field` (`.`).
+     */
+    pathBoundaryChars?:
+        string[] | ((defaultPathBoundaryChars: string[]) => string[]);
 };
 
 const createStore = <SM extends Record<Name, Section>>(
     sectionMap: SM,
-    options?: {
-        debugOptions?: DebugOptions;
-    }
+    options?: StoreOptions
 ): Store<SM> => {
+    let boundaryChars = DEFAULT_PATH_BOUNDARY_CHARS;
+    if (typeof options?.pathBoundaryChars === 'function') {
+        boundaryChars = options.pathBoundaryChars(DEFAULT_PATH_BOUNDARY_CHARS);
+    } else if (Array.isArray(options?.pathBoundaryChars)) {
+        boundaryChars = options.pathBoundaryChars;
+    }
+
     let counter = 0;
     const names: (keyof SM)[] = Object.keys(sectionMap);
     const subscribers = names.reduce((pre, name) => {
@@ -94,37 +165,47 @@ const createStore = <SM extends Record<Name, Section>>(
         subscribers,
         sectionMap,
         subscribe: (callback, name, path) => {
+            const sectionSubscribers = subscribers[name] as
+                Record<Path, Record<number, () => void>> | undefined;
+
+            if (sectionSubscribers === undefined) {
+                throw new Error(
+                    `YASM: cannot subscribe to unknown section "${name.toString()}". Make sure it is registered in createStore().`
+                );
+            }
+
             const id = counter++;
-            if (subscribers[name][path] !== undefined) {
-                subscribers[name][path][id] = callback;
+            if (sectionSubscribers[path] !== undefined) {
+                sectionSubscribers[path][id] = callback;
             } else {
-                (subscribers[name] as Record<Path, Record<number, () => void>>)[
-                    path
-                ] = {
+                sectionSubscribers[path] = {
                     [id]: callback
                 };
             }
             return () => {
-                if (subscribers[name]?.[path]?.[id] === undefined) {
-                    console.warn(
-                        [
-                            `YASM [Warning]: The state of "${name.toString()}" at path "${path}" has been purged before its dependent components were unmounted!`,
-                            `(Dependent components are those that read and use this state.)`,
-                            `Ensure that the purge action occurs at the right time (when all dependent components are unmounted) by using "useEffect" or "setTimeout" to prevent premature state purging.`
-                        ].join('\n')
-                    );
-                    return;
-                }
+                // Tolerant unsubscribe: it must not warn or
+                // crash here. The "purged while components are still mounted"
+                // warning is emitted by `purgeYasmState` itself, which knows
+                // how many subscribers were attached at purge time.
+                const record = (
+                    subscribers[name] as
+                        Record<Path, Record<number, () => void>> | undefined
+                )?.[path];
 
-                delete subscribers[name][path][id];
+                if (record !== undefined) {
+                    delete record[id];
+                }
             };
         },
-        pathRegistry: names.reduce((pre, name) => {
-            if (sectionMap[name].routing !== undefined) {
-                pre[name as Name] = [];
-            }
-            return pre;
-        }, {} as Record<Name, Path[]>),
+        pathRegistry: names.reduce(
+            (pre, name) => {
+                if (sectionMap[name].routing !== undefined) {
+                    pre[name as Name] = [];
+                }
+                return pre;
+            },
+            {} as Record<Name, Path[]>
+        ),
         routingPlan: names.reduce((pre, name) => {
             const routing = sectionMap[name].routing;
             if (routing !== undefined) {
@@ -133,7 +214,7 @@ const createStore = <SM extends Record<Name, Section>>(
                     if (process.env.NODE_ENV !== 'production') {
                         if (sectionMap[routingName] === undefined) {
                             console.error(
-                                `There is no ${routingName} section to have a route on!`
+                                `YASM: there is no "${routingName}" section to have a route on!`
                             );
                         }
                     }
@@ -150,10 +231,8 @@ const createStore = <SM extends Record<Name, Section>>(
             pre[name] = {};
             return pre;
         }, {} as Memo<SM>),
-        debugOptions: options?.debugOptions ?? {
-            serializer: undefined,
-            deserializer: undefined
-        }
+        pathBoundaryChars: boundaryChars,
+        debugOptions: options?.debugOptions ?? {}
     };
 };
 
@@ -172,4 +251,4 @@ export type {
     Store,
     DebugOptions
 };
-export { createStore };
+export { createStore, DEFAULT_PATH_BOUNDARY_CHARS };

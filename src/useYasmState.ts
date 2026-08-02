@@ -1,15 +1,13 @@
-import { produce } from 'immer';
 import { YasmContext } from './Context';
-import { useCallback, useContext, useSyncExternalStore } from 'react';
+import { immer, isPathWithinPrefix, snapshot } from './util';
+import { useContext, useSyncExternalStore } from 'react';
 import {
     Name,
     Path,
     PayloadAndPayloadCreator,
     Section,
-    StateBySectionMap,
     Store
 } from './createStore';
-import { snapshot } from './util';
 
 type OverrideInitialState<
     SM extends Record<Name, Section>,
@@ -54,7 +52,13 @@ function useYasmState<SM extends Record<Name, Section>, N extends keyof SM, S>(
     unknown extends S ? SM[N]['initialState'] : S,
     (payload: PayloadAndPayloadCreator<SM, N>) => SM[N]['initialState'] | void
 ] {
-    const store = useContext(YasmContext) as Store<SM>;
+    const store = useContext(YasmContext) as Store<SM> | undefined;
+
+    if (store === undefined) {
+        throw new Error(
+            'YASM: no store was found in the React context. Wrap your component tree in <YasmContext.Provider value={store}>.'
+        );
+    }
 
     let selector: ((state: SM[N]['initialState']) => S) | undefined;
     let overrideInitialState: OverrideInitialState<SM, N> | undefined;
@@ -66,254 +70,322 @@ function useYasmState<SM extends Record<Name, Section>, N extends keyof SM, S>(
         overrideInitialState = thirdParam.overrideInitialState;
     }
 
-    if (store.memo[name][path] === undefined) {
-        init(store, name, path, overrideInitialState);
-    }
+    const { subscribe, getState, updater } = init(
+        store,
+        name,
+        path,
+        overrideInitialState
+    );
 
-    const getState = store.memo[name][path].getState;
+    const selectedState = useSyncExternalStore(
+        subscribe,
+        selector === undefined ? getState : () => selector(getState())
+    );
 
-    return [
-        useSyncExternalStore(
-            store.memo[name][path].subscribe,
-            useCallback(() => {
-                const state = getState();
-                return selector !== undefined ? selector(state) : state;
-            }, [getState, selector])
-        ),
-        store.memo[name][path].updater
-    ];
+    return [selectedState, updater];
 }
 
+/**
+ * Initializes the state of `(name, path)` (when needed) and returns the
+ * memoized `{ subscribe, getState, updater }` record for it.
+ *
+ * Exported for advanced/manual usage and tests; components should normally
+ * use the `useYasmState` hook.
+ */
 const init = <SM extends Record<Name, Section>, N extends keyof SM>(
     store: Store<SM>,
     name: N,
     path: Path,
     overrideInitialState?: OverrideInitialState<SM, N>
-) => {
-    const [routedName, routedPath, getState, updater] = route(
-        store,
-        name,
-        path
-    );
+): {
+    subscribe: (callback: () => void) => () => void;
+    getState: () => SM[N]['initialState'];
+    updater: (payload: PayloadAndPayloadCreator<SM, N>) => void;
+} => {
+    const memo = store.memo[name] as
+        | Record<
+              Path,
+              {
+                  subscribe: (callback: () => void) => () => void;
+                  getState: () => any;
+                  updater: (payload: any) => void;
+              }
+          >
+        | undefined;
 
-    if (name === routedName && store.state[name][path] === undefined) {
-        (store.state[name] as Record<Path, SM[N]['initialState']>)[path] = {
-            ...store.sectionMap[name].initialState,
-            ...(typeof overrideInitialState === 'function'
-                ? overrideInitialState(store.sectionMap[name].initialState)
-                : overrideInitialState)
-        };
+    if (memo === undefined) {
+        throw new Error(
+            `YASM: unknown section "${name.toString()}". Make sure it is registered in createStore().`
+        );
+    }
 
-        if (store.sectionMap[name].routing !== undefined) {
+    const existingRecord = memo[path];
+    if (existingRecord !== undefined) {
+        return existingRecord;
+    }
+
+    const state = store.state as Record<Name, Record<Path, any>>;
+
+    const {
+        routedName,
+        routedPath,
+        getState: routedGetState,
+        applyPayload
+    } = route(store, name as Name, path);
+
+    if (name === routedName) {
+        // The state is stored directly (not routed into a parent section).
+        if (state[routedName][routedPath] === undefined) {
+            const initialState = store.sectionMap[name].initialState;
+
+            const override =
+                typeof overrideInitialState === 'function'
+                    ? (
+                          overrideInitialState as (
+                              initialState: SM[N]['initialState']
+                          ) => Partial<SM[N]['initialState']>
+                      )(initialState)
+                    : overrideInitialState;
+
+            state[routedName][routedPath] =
+                override === undefined
+                    ? initialState
+                    : { ...initialState, ...override };
+        }
+
+        if (
+            store.sectionMap[name].routing !== undefined &&
+            store.pathRegistry[name as Name].indexOf(path) === -1
+        ) {
             store.pathRegistry[name as Name].push(path);
         }
     }
 
-    store.memo[name as Name][path] = {
-        subscribe: callback =>
-            store.subscribe(callback, routedName, routedPath),
-        getState,
-        updater: payload => {
-            // This prevents errors when the updater is triggered asynchronously
-            // (e.g., in a `setTimeout`, `.then`, or other delayed executions) where the state might have been purged already.
-            const currentState = getState();
-            if (currentState === undefined) {
-                return;
-            }
+    const getState = () => routedGetState();
 
-            const _payload =
-                typeof payload === 'function'
-                    ? (
-                          payload as (
-                              state: SM[N]['initialState']
-                          ) => Parameters<SM[N]['updater']>[1]
-                      )(currentState)
-                    : payload;
+    const updater = (payload: PayloadAndPayloadCreator<SM, N>) => {
+        // These guards make the updater a safe no-op when it fires
+        // asynchronously (in a `setTimeout`, a resolved promise, a stale
+        // event handler, ...) after the state has been purged, or after a
+        // routed element (e.g. an ArraySection row) has been removed.
+        if (state[routedName]?.[routedPath] === undefined) {
+            return;
+        }
+        let currentState: any;
+        try {
+            currentState = getState();
+        } catch {
+            return;
+        }
+        if (currentState === undefined) {
+            return;
+        }
 
-            if (process.env.NODE_ENV !== 'production') {
-                console.debug('----start----');
-                console.debug(
-                    `${name as Name} ${path}${
-                        name !== routedName
-                            ? ` (${routedName} ${routedPath})`
-                            : ''
-                    }`
-                );
-                snapshot(_payload, store.debugOptions);
-                console.debug('before:');
-                snapshot(store.state, store.debugOptions);
-            }
+        const resolvedPayload =
+            typeof payload === 'function'
+                ? (payload as (state: any) => any)(currentState)
+                : payload;
 
-            store.state[routedName][routedPath] = updater(_payload);
+        const shouldLog =
+            process.env.NODE_ENV !== 'production' &&
+            store.debugOptions.logStateUpdates === true;
 
-            if (process.env.NODE_ENV !== 'production') {
-                console.debug('after:');
-                snapshot(store.state, store.debugOptions);
-                console.debug('----end----');
-            }
+        const snapshotScope = store.debugOptions?.snapshotScope || 'local';
 
-            for (const key in store.subscribers[routedName][routedPath]) {
-                store.subscribers[routedName][routedPath][key]();
+        if (shouldLog) {
+            console.debug(
+                `YASM: updating "${routedName}" at path "${routedPath}"`,
+                resolvedPayload
+            );
+            console.debug('before:');
+
+            snapshot(
+                snapshotScope === 'full'
+                    ? store.state
+                    : state[routedName][routedPath],
+                store.debugOptions
+            );
+        }
+
+        state[routedName][routedPath] = applyPayload(resolvedPayload);
+
+        if (shouldLog) {
+            console.debug('after:');
+            snapshot(
+                snapshotScope === 'full'
+                    ? store.state
+                    : state[routedName][routedPath],
+                store.debugOptions
+            );
+            console.debug('--------');
+        }
+
+        const pathSubscribers = (
+            store.subscribers as Record<
+                Name,
+                Record<Path, Record<number, () => void>>
+            >
+        )[routedName]?.[routedPath];
+
+        if (pathSubscribers !== undefined) {
+            // Iterate over a snapshot: callbacks may subscribe/unsubscribe.
+            for (const id of Object.keys(pathSubscribers)) {
+                const callback = pathSubscribers[id as unknown as number];
+                if (callback !== undefined) {
+                    callback();
+                }
             }
         }
     };
+
+    const record = {
+        subscribe: (callback: () => void) =>
+            store.subscribe(callback, routedName as keyof SM, routedPath),
+        getState,
+        updater
+    };
+    memo[path] = record;
+    return record;
 };
 
-const route = <SM extends Record<Name, Section>, N extends keyof SM>(
-    store: Store<SM>,
-    name: N,
+type RouteStep = { name: Name; path: Path };
+
+/**
+ * Computes where the state of `(name, path)` actually lives and returns
+ * accessors that read/update it through the routing chain.
+ */
+const route = (
+    store: Store<any>,
+    name: Name,
     path: Path
-): [
-    routedName: Name,
-    routedPath: Path,
-    getState: () => SM[N]['initialState'],
-    updater: (payload: Parameters<SM[N]['updater']>[1]) => SM[N]['initialState']
-] => {
-    const extraRoutes = getExtraRoutes(store, [name as Name], path);
-    if (extraRoutes !== undefined) {
-        return extraRoutes;
+): {
+    routedName: Name;
+    routedPath: Path;
+    getState: () => any;
+    applyPayload: (payload: any) => any;
+} => {
+    const state = store.state as Record<Name, Record<Path, any>>;
+    const chain = getExtraRoutes(store, [name], path);
+
+    if (chain === undefined) {
+        return {
+            routedName: name,
+            routedPath: path,
+            getState: () => state[name][path],
+            applyPayload: payload =>
+                immer.produce(state[name][path], (draft: any) =>
+                    store.sectionMap[name].updater(draft, payload)
+                )
+        };
     }
-    return [
-        name as Name,
-        path,
-        () => store.state[name][path],
-        payload =>
-            produce(store.state[name][path], (draft: any) => {
-                return store.sectionMap[name].updater(draft, payload);
-            })
-    ];
-};
 
-const getExtraRoutes = <SM extends Record<Name, Section>, N extends keyof SM>(
-    store: Store<SM>,
-    names: Name[],
-    path: Path
-):
-    | [
-          routedName: Name,
-          routedPath: Path,
-          getState: () => SM[N]['initialState'],
-          updater: (
-              payload: Parameters<SM[N]['updater']>[1]
-          ) => SM[N]['initialState']
-      ]
-    | undefined => {
-    const firstName = names[0];
-    if (process.env.NODE_ENV !== 'production') {
-        const getAllPathRegistry = (names: Name[] | undefined) => {
-            const allPaths: Path[] = [];
-            if (names === undefined || names.length === 0) {
-                return allPaths;
-            }
-            for (const name of names) {
-                allPaths.push(
-                    ...store.pathRegistry[name].filter(v => path.startsWith(v)),
-                    ...getAllPathRegistry(store.routingPlan[name])
+    const steps: RouteStep[] = [...chain, { name, path }];
+    const routedName = steps[0].name;
+    const routedPath = steps[0].path;
+
+    const getState = () => {
+        let currentState: any = state[routedName][routedPath];
+        for (let i = 0; i < steps.length - 1; i++) {
+            const pathQuery = steps[i + 1].path.slice(steps[i].path.length);
+            [currentState] = store.sectionMap[steps[i].name].routing![
+                steps[i + 1].name
+            ].selectByPathQuery(currentState, pathQuery);
+        }
+        return currentState;
+    };
+
+    const applyPayload = (payload: any) => {
+        const update = (stepIndex: number, subState: any): any => {
+            if (stepIndex === steps.length - 1) {
+                return immer.produce(subState, (draft: any) =>
+                    store.sectionMap[steps[stepIndex].name].updater(
+                        draft,
+                        payload
+                    )
                 );
             }
-            return allPaths;
+            const pathQuery = steps[stepIndex + 1].path.slice(
+                steps[stepIndex].path.length
+            );
+            return store.sectionMap[steps[stepIndex].name].routing![
+                steps[stepIndex + 1].name
+            ].updateByPathQuery(subState, pathQuery, (innerState: any) =>
+                update(stepIndex + 1, innerState)
+            );
         };
-        const allPaths = getAllPathRegistry(store.routingPlan[firstName]);
-        if (allPaths.length > 1) {
-            console.error(
-                'multiple routing candidates found.\n' +
-                    'your direct paths can not be suffix of each other.\n' +
-                    `paths: ${JSON.stringify(allPaths)}`
-            );
+        return update(0, state[routedName][routedPath]);
+    };
+
+    return { routedName, routedPath, getState, applyPayload };
+};
+
+/**
+ * Resolves the chain of parent sections that a routed `path` belongs to.
+ *
+ * Returns the chain from the outermost (actually stored) section down to the
+ * immediate parent of the requested path, or `undefined` when the path is
+ * stored directly (not routed).
+ *
+ * `allNames[0]` is the section currently being resolved; the rest of the
+ * array is only used as a circular-routing guard.
+ *
+ * NOTE: matching between the requested path and registered parent paths is
+ * segment-aware (`isPathWithinPrefix`). A plain `startsWith` check used to
+ * hijack routing between sibling paths such as `/t` and `/t2`, or `/tabs/1`
+ * and `/tabs/10`.
+ */
+const getExtraRoutes = (
+    store: Store<any>,
+    allNames: Name[],
+    path: Path
+): RouteStep[] | undefined => {
+    const currentName = allNames[0];
+    const parentNames = (store.routingPlan as Record<Name, Name[]>)[
+        currentName
+    ];
+    if (parentNames === undefined) {
+        return undefined;
+    }
+    const candidates: RouteStep[] = [];
+    for (const parentName of parentNames) {
+        const registeredPaths = store.pathRegistry[parentName] ?? [];
+        for (const registeredPath of registeredPaths) {
+            if (
+                registeredPath !== path &&
+                isPathWithinPrefix(
+                    path,
+                    registeredPath,
+                    store.pathBoundaryChars
+                )
+            ) {
+                candidates.push({ name: parentName, path: registeredPath });
+            }
         }
     }
-    for (const name of store.routingPlan[firstName] ?? []) {
-        const foundPath = store.pathRegistry[name].find(v =>
-            path.startsWith(v)
+    if (candidates.length === 0) {
+        return undefined;
+    }
+    if (process.env.NODE_ENV !== 'production' && candidates.length > 1) {
+        console.error(
+            [
+                'YASM: multiple routing candidates found. Registered routing paths must not be nested within each other (one path cannot be a segment-prefix of another).',
+                `section: "${currentName}", path: "${path}"`,
+                `candidates: ${JSON.stringify(candidates)}`
+            ].join('\n')
         );
-        if (foundPath !== undefined) {
-            const allNames = [name, ...names];
-            const selectByPathQuery = allNames.reduce(
-                (pre, current, i) => {
-                    if (i === names.length) {
-                        return pre;
-                    }
-                    return (state, pathQuery) =>
-                        store.sectionMap[current].routing![
-                            names[i]
-                        ].selectByPathQuery(...pre(state, pathQuery));
-                },
-                (state: StateBySectionMap<SM>, pathQuery: string) =>
-                    [state[name][foundPath], pathQuery] as [
-                        SM[N]['initialState'],
-                        string
-                    ]
-            );
-            const reversedAllNames = allNames.reverse();
-            const updateByPathQuery = reversedAllNames.reduce(
-                (pre, current, i) => {
-                    if (i === names.length) {
-                        return pre;
-                    }
-                    return (state, pathQuery, payload) =>
-                        store.sectionMap[reversedAllNames[i + 1]].routing![
-                            current
-                        ].updateByPathQuery(
-                            state,
-                            pathQuery,
-                            (state, pathQuery) => pre(state, pathQuery, payload)
-                        );
-                },
-                (
-                    state: unknown,
-                    pathQuery: string,
-                    payload: Parameters<SM[N]['updater']>[1]
-                ): SM[N]['initialState'] => {
-                    if (process.env.NODE_ENV !== 'production') {
-                        if (pathQuery !== '') {
-                            console.error(
-                                `updaters did not consume all of the pathQuery. remaining pathQuery:${pathQuery}, names: ${JSON.stringify(
-                                    name
-                                )}, name: ${name}, path:${path}`
-                            );
-                        }
-                    }
-                    return produce(state, draft =>
-                        store.sectionMap[names[names.length - 1]].updater(
-                            draft,
-                            payload
-                        )
-                    );
-                }
-            );
-            const pathQuery = path.slice(foundPath.length);
-            return [
-                name,
-                foundPath,
-                () => {
-                    const [selectedState, remainedPathQuery] =
-                        selectByPathQuery(store.state, pathQuery);
-                    if (process.env.NODE_ENV !== 'production') {
-                        if (remainedPathQuery !== '') {
-                            console.error(
-                                `selectors did not consume all of the pathQuery. remaining pathQuery:${remainedPathQuery}, names: ${JSON.stringify(
-                                    name
-                                )}, name: ${name}, path:${path}`
-                            );
-                        }
-                    }
-                    return selectedState;
-                },
-                payload => {
-                    return updateByPathQuery(
-                        store.state[name][foundPath],
-                        pathQuery,
-                        payload
-                    );
-                }
-            ];
-        }
-        const routingInfo = getExtraRoutes(store, [name, ...names], path);
-        if (routingInfo !== undefined) {
-            return routingInfo;
-        }
     }
-    return undefined;
+    const parent = candidates[0];
+    if (allNames.indexOf(parent.name) !== -1) {
+        // Circular routing guard: stop resolving instead of recursing forever.
+        return [parent];
+    }
+    const parentChain = getExtraRoutes(
+        store,
+        [parent.name, ...allNames],
+        parent.path
+    );
+    return parentChain === undefined ? [parent] : [...parentChain, parent];
 };
 
 export { useYasmState, init, route, getExtraRoutes };
+export type { OverrideInitialState };

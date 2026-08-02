@@ -1,5 +1,57 @@
-import { produce } from 'immer';
+import { Immer } from 'immer';
 import { DebugOptions, Name, Section, Updater } from './createStore';
+
+const immer = new Immer();
+
+/**
+ * Segment-aware prefix matching.
+ *
+ * ```
+ * isPathWithinPrefix('/tabs/1', '/tabs/1')       // true
+ * isPathWithinPrefix('/tabs/1/child', '/tabs/1') // true
+ * isPathWithinPrefix('/tabs/1[3]', '/tabs/1')    // true
+ * isPathWithinPrefix('/tabs/1', '')              // true (e.g., purge('') clears all states)
+ * isPathWithinPrefix('/tabs/10', '/tabs/1')      // false (!)
+ * ```
+ *
+ * The last case is the important one: a plain `String.prototype.startsWith`
+ * check would match `/tabs/10` too, which caused states of *other* tabs to be
+ * purged (and their routing to be hijacked) whenever more than 9 tabs were
+ * open.
+ */
+const isPathWithinPrefix = (
+    path: string,
+    prefix: string,
+    boundaryChars: string[]
+): boolean => {
+    // An empty prefix matches all paths (e.g., full state wipe)
+    if (prefix === '') {
+        return true;
+    }
+
+    // Exact match
+    if (path === prefix) {
+        return true;
+    }
+
+    // If it doesn't even start with the prefix, it's definitely not a match
+    if (!path.startsWith(prefix)) {
+        return false;
+    }
+
+    // Check segment boundaries to avoid false positives (like '/tabs/1' matching '/tabs/10')
+    const lastCharOfPrefix = prefix[prefix.length - 1];
+    const firstCharAfterPrefix = path[prefix.length];
+
+    // Handles cases where the prefix itself explicitly ends with a boundary (e.g., prefix: '/tabs/1/').
+    // If it does, we already know it's a complete segment, avoiding the '/tabs/1' vs '/tabs/10' issue natively.
+    const prefixEndsWithBoundaryChar = boundaryChars.includes(lastCharOfPrefix);
+
+    const pathContinuesWithBoundaryChar =
+        boundaryChars.includes(firstCharAfterPrefix);
+
+    return prefixEndsWithBoundaryChar || pathContinuesWithBoundaryChar;
+};
 
 // updaters
 type UpdatingKeyAndValue<T extends Record<string, unknown>> = {
@@ -47,11 +99,14 @@ const extractArrayIndexAndRemainedPathQuery = (
     pathQuery: string
 ): [index: number, remainedPathQuery: string] | string => {
     if (pathQuery[0] === '[') {
-        const closeBracketLastIndex = pathQuery.indexOf(']');
-        if (closeBracketLastIndex !== -1) {
-            const index = Number(pathQuery.slice(1, closeBracketLastIndex));
-            if (!Number.isNaN(index)) {
-                return [index, pathQuery.slice(closeBracketLastIndex + 1)];
+        const closeBracketIndex = pathQuery.indexOf(']');
+        // `closeBracketIndex > 1` also rejects an empty index (`[]`), which
+        // `Number('')` would otherwise silently coerce to `0`.
+        if (closeBracketIndex > 1) {
+            const rawIndex = pathQuery.slice(1, closeBracketIndex);
+            const index = Number(rawIndex);
+            if (Number.isInteger(index) && index >= 0) {
+                return [index, pathQuery.slice(closeBracketIndex + 1)];
             }
         }
     }
@@ -72,23 +127,31 @@ const arraySectionGenerator = <S, P>(
                 delete state.map[removingID];
             }
         }
-        if (editingItems !== undefined) {
-            for (const { id, itemPayload } of editingItems) {
-                const newValue = baseSection.updater(
-                    state.map[id],
-                    itemPayload
-                );
-                if (newValue !== undefined) {
-                    state.map[id] = newValue;
-                }
-            }
-        }
+        // Additions are applied before edits, so a payload may add an item and
+        // edit it in the same update.
         if (addingItems !== undefined) {
             for (const { id, partialState } of addingItems) {
                 state.map[id] = {
                     ...baseSection.initialState,
                     ...partialState
                 };
+            }
+        }
+        if (editingItems !== undefined) {
+            for (const { id, itemPayload } of editingItems) {
+                const itemState = state.map[id];
+                if (itemState === undefined) {
+                    if (process.env.NODE_ENV !== 'production') {
+                        console.warn(
+                            `YASM [Warning]: ArraySection "${sectionName.toString()}" received an editing payload for id "${id}" which does not exist in the map. The edit was skipped.`
+                        );
+                    }
+                    continue;
+                }
+                const newValue = baseSection.updater(itemState, itemPayload);
+                if (newValue !== undefined) {
+                    state.map[id] = newValue;
+                }
             }
         }
     },
@@ -98,12 +161,16 @@ const arraySectionGenerator = <S, P>(
                 const indexAndRemainedPathQuery =
                     extractArrayIndexAndRemainedPathQuery(pathQuery);
                 if (typeof indexAndRemainedPathQuery === 'string') {
-                    throw `error: ${indexAndRemainedPathQuery} ArraySection of ${sectionName}, pathQuery: ${pathQuery}`;
+                    throw new Error(
+                        `YASM: ${indexAndRemainedPathQuery} (ArraySection of "${sectionName.toString()}", pathQuery: "${pathQuery}")`
+                    );
                 }
                 const [index, remainedPathQuery] = indexAndRemainedPathQuery;
                 const subState = state.map[index];
                 if (subState === undefined) {
-                    throw 'This path is referring to a element that did not initialized.';
+                    throw new Error(
+                        `YASM: this path refers to an element (index ${index}) that has not been initialized (ArraySection of "${sectionName.toString()}").`
+                    );
                 }
                 return [subState, remainedPathQuery];
             },
@@ -111,12 +178,16 @@ const arraySectionGenerator = <S, P>(
                 const indexAndRemainedPathQuery =
                     extractArrayIndexAndRemainedPathQuery(pathQuery);
                 if (typeof indexAndRemainedPathQuery === 'string') {
-                    throw `error: ${indexAndRemainedPathQuery} ArraySection of ${sectionName}, pathQuery: ${pathQuery}`;
+                    throw new Error(
+                        `YASM: ${indexAndRemainedPathQuery} (ArraySection of "${sectionName.toString()}", pathQuery: "${pathQuery}")`
+                    );
                 }
                 const [index, remainedPathQuery] = indexAndRemainedPathQuery;
                 const subState = state.map[index];
                 if (subState === undefined) {
-                    throw 'This path is referring to a element that did not initialized.';
+                    throw new Error(
+                        `YASM: this path refers to an element (index ${index}) that has not been initialized (ArraySection of "${sectionName.toString()}").`
+                    );
                 }
                 return {
                     order: state.order,
@@ -144,10 +215,10 @@ const extractObjectIndexAndRemainedPathQuery = (
     pathQuery: string
 ): [index: string, remainedPathQuery: string] | string => {
     if (pathQuery[0] === '[') {
-        const closeBracketLastIndex = pathQuery.indexOf(']');
-        if (closeBracketLastIndex !== -1) {
-            const index = pathQuery.slice(1, closeBracketLastIndex);
-            return [index, pathQuery.slice(closeBracketLastIndex + 1)];
+        const closeBracketIndex = pathQuery.indexOf(']');
+        if (closeBracketIndex !== -1) {
+            const index = pathQuery.slice(1, closeBracketIndex);
+            return [index, pathQuery.slice(closeBracketIndex + 1)];
         }
     }
     return 'invalid ObjectSection path!';
@@ -161,7 +232,7 @@ const objectSectionGenerator = <SM extends Record<string, SectionWithName>>(
     ) as ObjectSectionState<SM>,
     updater: (state, payload) => {
         for (const key in payload) {
-            state[key] = produce(state[key], (draft: any) =>
+            state[key] = immer.produce(state[key], (draft: any) =>
                 sectionMap[key].updater(draft, payload[key])
             );
         }
@@ -174,13 +245,17 @@ const objectSectionGenerator = <SM extends Record<string, SectionWithName>>(
                     const indexAndRemainedPathQuery =
                         extractObjectIndexAndRemainedPathQuery(pathQuery);
                     if (typeof indexAndRemainedPathQuery === 'string') {
-                        throw `error: ${indexAndRemainedPathQuery} ObjectSection of ${name}. pathQuery: ${pathQuery}`;
+                        throw new Error(
+                            `YASM: ${indexAndRemainedPathQuery} (ObjectSection of "${name.toString()}", pathQuery: "${pathQuery}")`
+                        );
                     }
                     const [index, remainedPathQuery] =
                         indexAndRemainedPathQuery;
                     const subState = state[index];
                     if (subState === undefined) {
-                        throw 'This path is referring to a key that did not initialized.';
+                        throw new Error(
+                            `YASM: this path refers to a key ("${index}") that has not been initialized (ObjectSection of "${name.toString()}").`
+                        );
                     }
                     return [subState, remainedPathQuery];
                 },
@@ -188,13 +263,17 @@ const objectSectionGenerator = <SM extends Record<string, SectionWithName>>(
                     const indexAndRemainedPathQuery =
                         extractObjectIndexAndRemainedPathQuery(pathQuery);
                     if (typeof indexAndRemainedPathQuery === 'string') {
-                        throw `error: ${indexAndRemainedPathQuery} ObjectSection of ${name}. pathQuery: ${pathQuery}`;
+                        throw new Error(
+                            `YASM: ${indexAndRemainedPathQuery} (ObjectSection of "${name.toString()}", pathQuery: "${pathQuery}")`
+                        );
                     }
                     const [index, remainedPathQuery] =
                         indexAndRemainedPathQuery;
                     const subState = state[index];
                     if (subState === undefined) {
-                        throw 'This path is referring to a key that did not initialized.';
+                        throw new Error(
+                            `YASM: this path refers to a key ("${index}") that has not been initialized (ObjectSection of "${name.toString()}").`
+                        );
                     }
                     return {
                         ...state,
@@ -245,7 +324,7 @@ function getFieldSetter<TSection, TField extends keyof TSection>(
                                       ) => TSection[TField]
                                   )(prev[field])
                                 : valueOrCallback
-                    } as unknown as Partial<TSection>)
+                    }) as unknown as Partial<TSection>
             );
         };
 
@@ -259,23 +338,33 @@ function getFieldSetter<TSection, TField extends keyof TSection>(
 
     return fieldsCache.get(field) as (
         valueOrCallback:
-            | TSection[TField]
-            | ((prev: TSection[TField]) => TSection[TField])
+            TSection[TField] | ((prev: TSection[TField]) => TSection[TField])
     ) => void;
 }
 
-const UNDEF_MARKER = { __YASM_SNAP_UNDEF__: true };
+const UNDEFINED_PLACEHOLDER_KEY = '__YASM_SNAP_UNDEF__';
+
+const UNDEFINED_PLACEHOLDER = { [UNDEFINED_PLACEHOLDER_KEY]: true };
+
+function isRawObject(value: unknown): value is Record<PropertyKey, unknown> {
+    return (
+        value !== null &&
+        typeof value === 'object' &&
+        !Array.isArray(value) &&
+        value.constructor === Object
+    );
+}
 
 function preEncode(value: unknown): unknown {
     if (value === undefined) {
-        return UNDEF_MARKER;
+        return UNDEFINED_PLACEHOLDER;
     }
 
     if (Array.isArray(value)) {
         return value.map(preEncode);
     }
 
-    if (value && typeof value === 'object') {
+    if (isRawObject(value)) {
         const res: Record<string, unknown> = {};
         for (const [k, v] of Object.entries(value)) {
             res[k] = preEncode(v);
@@ -291,8 +380,11 @@ function postDecode(value: unknown): unknown {
         return value.map(postDecode);
     }
 
-    if (value && typeof value === 'object') {
-        if ((value as any).__YASM_SNAP_UNDEF__) return undefined;
+    if (isRawObject(value)) {
+        if ((value as Record<string, unknown>)[UNDEFINED_PLACEHOLDER_KEY]) {
+            return undefined;
+        }
+
         const res: Record<string, unknown> = {};
         for (const [k, v] of Object.entries(value)) {
             res[k] = postDecode(v);
@@ -302,7 +394,6 @@ function postDecode(value: unknown): unknown {
 
     return value;
 }
-
 const snapshot = (obj: Record<string, unknown>, debugOptions: DebugOptions) => {
     const encoded = preEncode(obj);
 
@@ -319,7 +410,9 @@ const snapshot = (obj: Record<string, unknown>, debugOptions: DebugOptions) => {
 };
 
 export {
+    immer,
     snapshot,
+    isPathWithinPrefix,
     arraySectionGenerator,
     extractArrayIndexAndRemainedPathQuery,
     extractObjectIndexAndRemainedPathQuery,
