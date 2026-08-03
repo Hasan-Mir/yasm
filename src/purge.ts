@@ -37,9 +37,15 @@ const purgeYasmState = (
         store.debugOptions.logStateUpdates === true;
 
     const purgeScope = store.debugOptions.purgeSnapshotScope || 'none';
+    const purgedPaths = shouldLog ? new Set<string>() : null;
 
     if (shouldLog) {
-        console.debug(`purging paths matching "${pathPrefix}"`);
+        const matchTypeStr =
+            options?.match === 'startsWith'
+                ? 'starting with'
+                : 'matching segment';
+
+        console.debug(`purging paths ${matchTypeStr} "${pathPrefix}"`);
 
         if (purgeScope === 'full') {
             console.debug('before purge:');
@@ -52,6 +58,8 @@ const purgeYasmState = (
     // longer exist in the current section map (state without matching
     // subscribers/memo records). Unguarded accesses used to crash with
     // "cannot read/delete property of undefined".
+
+    // 1. Remove the actual data values from the state
     for (const name of Object.keys(store.state) as Name[]) {
         const sectionState = store.state[name] as
             Record<Path, unknown> | undefined;
@@ -63,10 +71,12 @@ const purgeYasmState = (
         for (const path of Object.keys(sectionState)) {
             if (matches(path)) {
                 delete sectionState[path];
+                purgedPaths?.add(path);
             }
         }
     }
 
+    // 2. Remove active subscriptions and warn if components are still mounted
     for (const name of Object.keys(store.subscribers) as Name[]) {
         const sectionSubscribers = store.subscribers[name] as
             Record<Path, Record<number, () => void>> | undefined;
@@ -93,9 +103,11 @@ const purgeYasmState = (
             }
 
             delete sectionSubscribers[path];
+            purgedPaths?.add(path);
         }
     }
 
+    // 3. Remove memoized hook configurations and cached plumbing
     for (const name of Object.keys(store.memo) as Name[]) {
         const sectionMemo = store.memo[name] as
             Record<Path, unknown> | undefined;
@@ -107,10 +119,12 @@ const purgeYasmState = (
         for (const path of Object.keys(sectionMemo)) {
             if (matches(path)) {
                 delete sectionMemo[path];
+                purgedPaths?.add(path);
             }
         }
     }
 
+    // 4. Remove the matched paths from the internal tracking registry
     for (const name of Object.keys(store.pathRegistry)) {
         const registeredPaths = store.pathRegistry[name];
 
@@ -118,18 +132,26 @@ const purgeYasmState = (
             continue;
         }
 
-        store.pathRegistry[name] = registeredPaths.filter(
-            path => !matches(path)
-        );
+        store.pathRegistry[name] = registeredPaths.filter(path => {
+            if (matches(path)) {
+                purgedPaths?.add(path);
+                return false;
+            }
+            return true;
+        });
     }
 
     if (shouldLog) {
+        console.debug(
+            `purge completed. Removed ${purgedPaths?.size} paths:`,
+            Array.from(purgedPaths || [])
+        );
+
         if (purgeScope === 'full') {
             console.debug('after purge:');
             snapshot(store.state, store.debugOptions);
-        } else {
-            console.debug('purge completed.');
         }
+
         console.debug('--------');
     }
 };
