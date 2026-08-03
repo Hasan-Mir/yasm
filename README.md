@@ -2,7 +2,7 @@
 
 > Path-based, purgeable, composable state management for React — built on `useSyncExternalStore` and `immer`.
 
-YASM organizes state as a grid of **Sections × Paths**. A *section* defines the shape and update logic of a piece of state (like a mini-reducer), and a *path* is a string address for one **instance** of that section. This makes YASM ideal for apps that open many instances of the same UI at once — like an ERP with dozens of tabs, tables and dialogs — and lets you **purge** everything under a path when a tab closes.
+YASM organizes state as a grid of **Sections × Paths**. A _section_ defines the shape and update logic of a piece of state (like a mini-reducer), and a _path_ is a string address for one **instance** of that section. This makes YASM ideal for apps that open many instances of the same UI at once — like an ERP with dozens of tabs, tables and dialogs — and lets you **purge** everything under a path when a tab closes.
 
 ---
 
@@ -10,7 +10,7 @@ YASM organizes state as a grid of **Sections × Paths**. A *section* defines the
 
 - 🗂️ **Multi-instance state** — the same section can live at unlimited paths: `useYasmState('UserTable', '/tabs/1/users')` and `useYasmState('UserTable', '/tabs/2/users')` are fully independent.
 - 🧹 **Purgeable state** — free all state under a path prefix in one call: `purge('/tabs/1')`. Segment-aware matching guarantees `/tabs/1` never touches `/tabs/10`.
-- 🧬 **Composable sections** — `arraySectionGenerator` and `objectSectionGenerator` build parent sections whose children are addressable through **path routing**: `useYasmState('Row', '/table[3]')` reads/writes the row *inside* the table state, immutably, with parent subscribers notified.
+- 🧬 **Composable sections** — `arraySectionGenerator` and `objectSectionGenerator` build parent sections whose children are addressable through **path routing**: `useYasmState('Row', '/table[3]')` reads/writes the row _inside_ the table state, immutably, with parent subscribers notified.
 - ⚡ **Precise re-renders** — components subscribe per `(section, path)` and can narrow further with selectors. No top-down re-render cascades.
 - ✍️ **Reducer-like updaters with immer** — write mutable code, get immutable updates. Updaters returning an unchanged state produce **no** notification churn (reference equality is preserved).
 - 🦥 **Lazy initialization** — state is created on first use, optionally with `overrideInitialState` (object or function form).
@@ -24,8 +24,8 @@ YASM organizes state as a grid of **Sections × Paths**. A *section* defines the
 ## 📦 Installation
 
 ```bash
-npm install @mrnafisia/yasm immer
-# react >= 18.2 is a peer dependency
+npm install @mrnafisia/yasm
+# react >= 18.2 is a peer dependency (immer is included automatically)
 ```
 
 ---
@@ -64,7 +64,11 @@ const App = () => (
 // 4. Use it — each path is an independent instance
 const Counter = ({ path }: { path: string }) => {
     const [count, update] = useYasmState('Counter', path, s => s.count);
-    return <button onClick={() => update(s => ({ count: s.count + 1 }))}>{count}</button>;
+    return (
+        <button onClick={() => update(s => ({ count: s.count + 1 }))}>
+            {count}
+        </button>
+    );
 };
 ```
 
@@ -77,7 +81,7 @@ const Counter = ({ path }: { path: string }) => {
 A section is `{ initialState, updater, routing? }`. The updater is immer-powered: mutate the draft **or** return a new state.
 
 ```ts
-const todoSection: Section<Todo[], { add: Todo }> = {
+const todoSection: Section<Todo[], Todo add: { }> = {
     initialState: [],
     updater: (state, { add }) => {
         state.push(add); // mutate freely — immer handles immutability
@@ -93,8 +97,8 @@ Paths are plain strings, but by convention they are hierarchical: `/tabs/12/user
 
 ```ts
 const [state, update] = useYasmState('Counter', '/c');
-update({ count: 5 });                          // payload
-update(prev => ({ count: prev.count + 1 }));   // payload creator (reads latest state)
+update({ count: 5 }); // payload
+update(prev => ({ count: prev.count + 1 })); // payload creator (reads latest state)
 ```
 
 ### Selectors & overrides
@@ -123,7 +127,10 @@ const store = createStore({
 
 // Parent: the whole table
 const [table, updateTable] = useYasmState('UserTable', '/users');
-updateTable({ addingItems: [{ id: 7, partialState: { name: 'Sara' } }], order: [7] });
+updateTable({
+    addingItems: [{ id: 7, partialState: { name: 'Sara' } }],
+    order: [7]
+});
 
 // Child: one row, addressed *through* the parent
 const [row, updateRow] = useYasmState('UserRow', '/users[7]');
@@ -156,7 +163,7 @@ purge('/tabs/12'); // removes state, subscribers, memo records & path registrati
 ```
 
 - Matching is **segment-aware** by default. Pass `{ match: 'startsWith' }` for the legacy raw-prefix behavior.
-- Purge **after** the components using that state have unmounted (e.g. from a `useEffect` + `setTimeout` at the app root). In development, YASM warns *at purge time* if subscribers are still attached — with the exact section and path.
+- Purge **after** the components using that state have unmounted (e.g. from a `useEffect` + `setTimeout` at the app root). In development, YASM warns _at purge time_ if subscribers are still attached — with the exact section and path.
 - Purging is idempotent and never throws for unknown/already-purged paths or stale sections restored from persistence.
 - Outside React (tests, event buses), use the pure function: `purgeYasmState(store, '/tabs/12')`.
 
@@ -164,22 +171,28 @@ purge('/tabs/12'); // removes state, subscribers, memo records & path registrati
 
 ## 🧪 Generic sections
 
-Section *generators* make one definition reusable for many types:
+You can easily write generator functions to reuse section definitions for different types:
 
 ```ts
+// Create a reusable generator for simple value states
+const createValueSection = <T>(initial: T): Section<{ value: T }, T> => ({
+    initialState: { value: initial },
+    updater: (state, payload) => {
+        state.value = payload;
+    }
+});
+
 const store = createStore({
-    NumberArray: arrayValueSectionGenerator<number>(),     // { value: number[] }
-    StringArray: arrayValueSectionGenerator<string>(),     // { value: string[] }
-    Volume: valueSectionGenerator(50),                     // { value: number }
-    Theme: valueSectionGenerator<'light' | 'dark'>('light')
+    Volume: createValueSection<number>(50),
+    Theme: createValueSection<'light' | 'dark'>('light')
 });
 ```
 
 Can one **single** section be generic at the use-site (`useYasmState<'Array', number>(...)`)? Not fully — TypeScript generics are erased at runtime and a concrete store object cannot store “a section of any `T`”. The idiomatic pattern is a single `unknown`-typed section plus a tiny **typed wrapper hook**:
 
 ```ts
-// store: GenericValue: valueSectionGenerator<unknown>(undefined)
-const useValueState = <T,>(path: string, initial: T) => {
+// store: GenericValue: createValueSection<unknown>(undefined)
+const useValueState = <T>(path: string, initial: T) => {
     const [state, update] = useYasmState('GenericValue', path, {
         selector: s => s.value as T,
         overrideInitialState: { value: initial }
@@ -198,26 +211,31 @@ You get full type inference at every call site with one section definition.
 
 - 🏷️ Name paths after your UI hierarchy (`/tabs/{id}/...`) so a single purge call cleans a whole tab.
 - 🧯 Don't purge paths that are still rendered — e.g. don't purge a dialog's path from a “refresh” action while the dialog is open.
-- 🔁 Don't subscribe to state you only *write*. Use a constant selector (`() => null`) to get just the updater without re-rendering on changes.
+- 🔁 Don't subscribe to state you only _write_. Use a constant selector (`() => null`) to get just the updater without re-rendering on changes.
 - 💾 Persistence: serialize `store.state` + `store.pathRegistry` yourself (YASM keeps them plain-JSON friendly). When restoring, **filter out sections that no longer exist** in your section map and merge each path over the section's current `initialState` so newly added fields get defaults.
-- 🐞 Debugging: `createStore(map, { debugOptions: { logStateUpdates: true } })` logs every update and purge with before/after snapshots (dev only — it's expensive, hence opt-in).
-- 🚫 A payload that is a function is always treated as a payload *creator* — don't store bare functions as payloads.
+- 🐞 Debugging: YASM provides granular debugging options in `createStore`:
+- `debugOptions: { logStateUpdates: true }`: Enables state logging in dev mode.
+- `snapshotScope: 'local' | 'full'`: Control whether logging snapshots just the changed path or the entire store.
+- `purgeSnapshotScope: 'none' | 'full'`: Logs before/after state when purging paths.
+- Custom serializers/deserializers are available for handling complex objects like `Date` or `BigInt`.
+
+- 🚫 A payload that is a function is always treated as a payload _creator_ — don't store bare functions as payloads.
 
 ---
 
 ## ⚖️ Comparison with other libraries
 
-| | **YASM** | **Redux Toolkit** | **Zustand** | **Jotai** | **React Context** |
-|---|---|---|---|---|---|
-| Mental model | Sections × Paths | Single store + slices | Store hooks | Atoms | Tree-scoped values |
-| Multi-instance state | ✅ first-class (paths) | 🔶 manual (keyed slices) | 🔶 store factories | 🔶 atom families | 🔶 nested providers |
-| Freeing memory (purge) | ✅ one call per path prefix | 🔶 manual actions | 🔶 manual | ✅ auto GC-ish (unmount) | ✅ unmount |
-| Re-render precision | ✅ per path + selector | ✅ selectors | ✅ selectors | ✅ per atom | ❌ all consumers |
-| Immutability | ✅ immer built-in | ✅ immer built-in | 🔶 manual/middleware | ✅ | — |
-| Boilerplate | Low | Medium | Low | Low | Low |
-| Devtools | ❌ (logging only) | ✅ excellent | ✅ | ✅ | ❌ |
-| Ecosystem/middleware | ❌ minimal | ✅ huge | ✅ rich | ✅ rich | — |
-| Best for | Tabbed/multi-instance apps (ERP, editors) | Large teams, strict conventions | General apps | Fine-grained derived state | Rarely-changing config |
+|                        | **YASM**                                  | **Redux Toolkit**               | **Zustand**          | **Jotai**                  | **React Context**      |
+| ---------------------- | ----------------------------------------- | ------------------------------- | -------------------- | -------------------------- | ---------------------- |
+| Mental model           | Sections × Paths                          | Single store + slices           | Store hooks          | Atoms                      | Tree-scoped values     |
+| Multi-instance state   | ✅ first-class (paths)                    | 🔶 manual (keyed slices)        | 🔶 store factories   | 🔶 atom families           | 🔶 nested providers    |
+| Freeing memory (purge) | ✅ one call per path prefix               | 🔶 manual actions               | 🔶 manual            | ✅ auto GC-ish (unmount)   | ✅ unmount             |
+| Re-render precision    | ✅ per path + selector                    | ✅ selectors                    | ✅ selectors         | ✅ per atom                | ❌ all consumers       |
+| Immutability           | ✅ immer built-in                         | ✅ immer built-in               | 🔶 manual/middleware | ✅                         | —                      |
+| Boilerplate            | Low                                       | Medium                          | Low                  | Low                        | Low                    |
+| Devtools               | ❌ (logging only)                         | ✅ excellent                    | ✅                   | ✅                         | ❌                     |
+| Ecosystem/middleware   | ❌ minimal                                | ✅ huge                         | ✅ rich              | ✅ rich                    | —                      |
+| Best for               | Tabbed/multi-instance apps (ERP, editors) | Large teams, strict conventions | General apps         | Fine-grained derived state | Rarely-changing config |
 
 **When YASM shines** 🌟: many simultaneous instances of the same screens whose state must be created and destroyed dynamically (tabs, windows, dialogs, wizards) — the path model plus purge is exactly this use case.
 
@@ -227,21 +245,19 @@ You get full type inference at every call site with one section definition.
 
 ## 📚 API reference (summary)
 
-| Export | Kind | Description |
-|---|---|---|
-| `createStore(sectionMap, options?)` | function | Creates the store. `options.debugOptions`: `logStateUpdates`, `serializer`, `deserializer`. |
-| `YasmContext` | context | Provide the store to your tree. |
-| `useYasmState(name, path, selectorOrOptions?)` | hook | Returns `[state, updater]`. Options: `selector`, `overrideInitialState`. |
-| `usePurgeYasmState()` | hook | Returns `purge(pathPrefix, options?)`. |
-| `purgeYasmState(store, pathPrefix, options?)` | function | Pure purge — usable outside React. |
-| `valueSectionGenerator<T>(initial)` | function | Generic `{ value: T }` section. |
-| `arrayValueSectionGenerator<T>(initial?)` | function | Generic `{ value: T[] }` section. |
-| `arraySectionGenerator(childName, childSection)` | function | Ordered map of child states with routing. |
-| `objectSectionGenerator(map)` | function | Named composition of child sections with routing. |
-| `mergeUpdaterGenerator<S>()` | function | `Partial<S>` shallow-merge updater. |
-| `propertyUpdaterGenerator<S>()` | function | `{ key, value }` updater. |
-| `getFieldSetter(updateState, field)` | function | Cached per-field setter factory. |
-| `isPathWithinPrefix(path, prefix)` | function | Segment-aware prefix check. |
+| Export                                            | Kind     | Description                                                                                                                        |
+| ------------------------------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `createStore(sectionMap, options?)`               | function | Creates the store. `options.debugOptions`: `logStateUpdates`, `snapshotScope`, `purgeSnapshotScope`, `serializer`, `deserializer`. |
+| `YasmContext`                                     | context  | Provide the store to your tree.                                                                                                    |
+| `useYasmState(name, path, selectorOrOptions?)`    | hook     | Returns `[state, updater]`. Options: `selector`, `overrideInitialState`.                                                           |
+| `usePurgeYasmState()`                             | hook     | Returns `purge(pathPrefix, options?)`.                                                                                             |
+| `purgeYasmState(store, pathPrefix, options?)`     | function | Pure purge — usable outside React.                                                                                                 |
+| `arraySectionGenerator(childName, childSection)`  | function | Ordered map of child states with routing.                                                                                          |
+| `objectSectionGenerator(map)`                     | function | Named composition of child sections with routing.                                                                                  |
+| `mergeUpdaterGenerator<S>()`                      | function | `Partial<S>` shallow-merge updater.                                                                                                |
+| `propertyUpdaterGenerator<S>()`                   | function | `{ key, value }` updater.                                                                                                          |
+| `getFieldSetter(updateState, field)`              | function | Cached per-field setter factory.                                                                                                   |
+| `isPathWithinPrefix(path, prefix, boundaryChars)` | function | Segment-aware prefix check.                                                                                                        |
 
 ---
 
