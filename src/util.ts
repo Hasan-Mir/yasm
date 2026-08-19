@@ -1,5 +1,5 @@
 import { Immer } from 'immer';
-import { DebugOptions, Name, Section, Updater } from './createStore';
+import { Name, Section, StoreOptions, Updater } from './createStore';
 
 const immer = new Immer();
 
@@ -189,15 +189,83 @@ const arraySectionGenerator = <S, P>(
                         `YASM: this path refers to an element (index ${index}) that has not been initialized (ArraySection of "${sectionName.toString()}").`
                     );
                 }
+
+                const newSubState = getNewState(subState, remainedPathQuery);
+
+                // 🔒 Preserve reference equality if child state hasn't mutated
+                if (newSubState === subState) {
+                    return state;
+                }
+
                 return {
                     order: state.order,
                     map: {
                         ...state.map,
-                        [index]: getNewState(subState, remainedPathQuery)
+                        [index]: newSubState
                     }
                 };
             }
         }
+    },
+    normalize: (storedValue, { defaultNormalize }) => {
+        if (!storedValue || typeof storedValue !== 'object') {
+            return { order: [], map: {} };
+        }
+
+        const newMap: Record<number, any> = {};
+
+        if (storedValue.map && typeof storedValue.map === 'object') {
+            for (const id in storedValue.map) {
+                const numericId = Number(id);
+                // An empty/whitespace key would coerce via Number('') === 0
+                // and masquerade as a real row id.
+                if (id.trim() !== '' && !Number.isNaN(numericId)) {
+                    newMap[numericId] = defaultNormalize(
+                        storedValue.map[id],
+                        baseSection.initialState,
+                        sectionName
+                    );
+                }
+            }
+        }
+
+        // Drop order entries whose item did not survive normalization so
+        // consumers never iterate over ids missing from the map.
+        const rawOrder: unknown[] = Array.isArray(storedValue.order)
+            ? storedValue.order
+            : [];
+
+        // 🛡️ Heal corrupted order data: coerce stringified ids to numbers,
+        // drop non-numeric garbage (Number(null) === 0 and Number(true) === 1
+        // would otherwise validate it as real ids), drop ids missing from
+        // the map, and deduplicate (duplicates would surface as React
+        // duplicate-key warnings downstream).
+        const seenIds = new Set<number>();
+        const order: number[] = [];
+        for (const id of rawOrder) {
+            let numericId = NaN;
+            if (typeof id === 'number') {
+                numericId = id;
+            } else if (typeof id === 'string' && id.trim() !== '') {
+                numericId = Number(id);
+            }
+
+            if (
+                Number.isNaN(numericId) ||
+                newMap[numericId] === undefined ||
+                seenIds.has(numericId)
+            ) {
+                continue;
+            }
+
+            seenIds.add(numericId);
+            order.push(numericId);
+        }
+
+        return {
+            order,
+            map: newMap
+        };
     }
 });
 
@@ -216,7 +284,10 @@ const extractObjectIndexAndRemainedPathQuery = (
 ): [index: string, remainedPathQuery: string] | string => {
     if (pathQuery[0] === '[') {
         const closeBracketIndex = pathQuery.indexOf(']');
-        if (closeBracketIndex !== -1) {
+
+        // `closeBracketIndex > 1` rejects an empty index (`[]`), ensuring
+        // we don't accidentally extract an empty string `""` as a valid object key.
+        if (closeBracketIndex > 1) {
             const index = pathQuery.slice(1, closeBracketIndex);
             return [index, pathQuery.slice(closeBracketIndex + 1)];
         }
@@ -275,14 +346,47 @@ const objectSectionGenerator = <SM extends Record<string, SectionWithName>>(
                             `YASM: this path refers to a key ("${index}") that has not been initialized (ObjectSection of "${name.toString()}").`
                         );
                     }
+
+                    const newSubState = getNewState(
+                        subState,
+                        remainedPathQuery
+                    );
+
+                    // 🔒 Preserve reference equality if child state hasn't mutated
+                    if (newSubState === subState) {
+                        return state;
+                    }
+
                     return {
                         ...state,
-                        [index]: getNewState(subState, remainedPathQuery)
+                        [index]: newSubState
                     };
                 }
             }
         ])
-    )
+    ),
+    normalize: (storedValue, { defaultNormalize }) => {
+        const initial = Object.fromEntries(
+            Object.entries(sectionMap).map(([key, { state }]) => [key, state])
+        ) as ObjectSectionState<SM>;
+
+        if (!storedValue || typeof storedValue !== 'object') {
+            return { ...initial };
+        }
+
+        const newState: any = {};
+
+        for (const key in sectionMap) {
+            const childDef = sectionMap[key];
+            newState[key] = defaultNormalize(
+                storedValue[key],
+                childDef.state,
+                childDef.name
+            );
+        }
+
+        return newState;
+    }
 });
 
 const fieldSettersCache = new WeakMap<
@@ -395,16 +499,19 @@ function postDecode(value: unknown): unknown {
     return value;
 }
 
-const snapshot = (obj: Record<string, unknown>, debugOptions: DebugOptions) => {
+const snapshot = (
+    obj: Record<string, unknown>,
+    storeOptions: StoreOptions<any>
+) => {
     const encoded = preEncode(obj);
 
     const json = JSON.stringify(encoded, function (key, value) {
-        return debugOptions.serializer
-            ? debugOptions.serializer(this, key, value)
+        return storeOptions.serializer
+            ? storeOptions.serializer(this, key, value)
             : value;
     });
 
-    const parsed = JSON.parse(json, debugOptions.deserializer);
+    const parsed = JSON.parse(json, storeOptions.deserializer);
     const restored = postDecode(parsed);
 
     console.debug(restored);
@@ -456,17 +563,17 @@ const deepFreeze = <T>(
 };
 
 export {
-    immer,
-    snapshot,
-    deepFreeze,
-    isPathWithinPrefix,
     arraySectionGenerator,
+    deepFreeze,
     extractArrayIndexAndRemainedPathQuery,
     extractObjectIndexAndRemainedPathQuery,
     getFieldSetter,
+    immer,
+    isPathWithinPrefix,
     mergeUpdaterGenerator,
     objectSectionGenerator,
     propertyUpdaterGenerator,
+    snapshot,
     type ArraySection,
     type ObjectSection,
     type ObjectSectionState,

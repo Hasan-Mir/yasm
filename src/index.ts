@@ -23,6 +23,11 @@ export {
     type Path,
     type DebugOptions,
     type PayloadAndPayloadCreator,
+    type StoreOptions,
+    type PersistConfig,
+    type StateMigration,
+    type PersistedSnapshot,
+    type YasmPersistenceAdapter,
     createStore,
     DEFAULT_PATH_BOUNDARY_CHARS
 } from './createStore';

@@ -6,7 +6,8 @@ import {
     Path,
     PayloadAndPayloadCreator,
     Section,
-    Store
+    Store,
+    SYMBOL_NOTIFY_CHANGE
 } from './createStore';
 
 type OverrideInitialState<
@@ -77,9 +78,13 @@ function useYasmState<SM extends Record<Name, Section>, N extends keyof SM, S>(
         overrideInitialState
     );
 
+    const getSnapshot =
+        selector === undefined ? getState : () => selector(getState());
+
     const selectedState = useSyncExternalStore(
         subscribe,
-        selector === undefined ? getState : () => selector(getState())
+        getSnapshot,
+        getSnapshot
     );
 
     return [selectedState, updater];
@@ -147,7 +152,7 @@ const init = <SM extends Record<Name, Section>, N extends keyof SM>(
                       )(initialState)
                     : overrideInitialState;
 
-            let finalInitialState =
+            const finalInitialState =
                 override === undefined
                     ? initialState
                     : { ...initialState, ...override };
@@ -192,6 +197,14 @@ const init = <SM extends Record<Name, Section>, N extends keyof SM>(
                 ? (payload as (state: any) => any)(currentState)
                 : payload;
 
+        const nextState = applyPayload(resolvedPayload);
+
+        // Reference equality check: If immer returns the exact same object,
+        // it means no mutations occurred. We should abort to prevent notification/save churn.
+        if (nextState === state[routedName][routedPath]) {
+            return;
+        }
+
         const shouldLog =
             process.env.NODE_ENV !== 'production' &&
             store.debugOptions.logStateUpdates === true;
@@ -209,11 +222,14 @@ const init = <SM extends Record<Name, Section>, N extends keyof SM>(
                 snapshotScope === 'full'
                     ? store.state
                     : state[routedName][routedPath],
-                store.debugOptions
+                store
             );
         }
 
-        state[routedName][routedPath] = applyPayload(resolvedPayload);
+        state[routedName][routedPath] = nextState;
+
+        // 🔒 Trigger internal notifications (auto-save and change listeners)
+        store[SYMBOL_NOTIFY_CHANGE]();
 
         if (shouldLog) {
             console.debug('after:');
@@ -221,7 +237,7 @@ const init = <SM extends Record<Name, Section>, N extends keyof SM>(
                 snapshotScope === 'full'
                     ? store.state
                     : state[routedName][routedPath],
-                store.debugOptions
+                store
             );
             console.debug('--------');
         }
@@ -234,7 +250,6 @@ const init = <SM extends Record<Name, Section>, N extends keyof SM>(
         )[routedName]?.[routedPath];
 
         if (pathSubscribers !== undefined) {
-            // Iterate over a snapshot: callbacks may subscribe/unsubscribe.
             for (const id of Object.keys(pathSubscribers)) {
                 const callback = pathSubscribers[id as unknown as number];
                 if (callback !== undefined) {
@@ -260,8 +275,8 @@ type RouteStep = { name: Name; path: Path };
  * Computes where the state of `(name, path)` actually lives and returns
  * accessors that read/update it through the routing chain.
  */
-const route = (
-    store: Store<any>,
+const route = <SM extends Record<Name, Section>>(
+    store: Store<SM>,
     name: Name,
     path: Path
 ): {
@@ -340,8 +355,8 @@ const route = (
  * hijack routing between sibling paths such as `/t` and `/t2`, or `/tabs/1`
  * and `/tabs/10`.
  */
-const getExtraRoutes = (
-    store: Store<any>,
+const getExtraRoutes = <SM extends Record<Name, Section>>(
+    store: Store<SM>,
     allNames: Name[],
     path: Path
 ): RouteStep[] | undefined => {

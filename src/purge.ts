@@ -1,5 +1,11 @@
 import { isPathWithinPrefix, snapshot } from './util';
-import { Name, Path, Store } from './createStore';
+import {
+    SYMBOL_NOTIFY_CHANGE,
+    Name,
+    Path,
+    Store,
+    Section
+} from './createStore';
 
 type PurgeOptions = {
     /**
@@ -22,8 +28,8 @@ type PurgeOptions = {
  * can use the `usePurgeYasmState` hook, which simply binds this function to
  * the store in context.
  */
-const purgeYasmState = (
-    store: Store,
+const purgeYasmState = <SM extends Record<Name, Section>>(
+    store: Store<SM>,
     pathPrefix: string,
     options?: PurgeOptions
 ): void => {
@@ -36,6 +42,7 @@ const purgeYasmState = (
         process.env.NODE_ENV !== 'production' &&
         store.debugOptions.logStateUpdates === true;
 
+    let isStateChanged = false;
     const purgeScope = store.debugOptions.purgeSnapshotScope || 'none';
     const purgedPaths = shouldLog ? new Set<string>() : null;
 
@@ -49,7 +56,7 @@ const purgeYasmState = (
 
         if (purgeScope === 'full') {
             console.debug('before purge:');
-            snapshot(store.state, store.debugOptions);
+            snapshot(store.state, store);
         }
     }
 
@@ -72,6 +79,7 @@ const purgeYasmState = (
             if (matches(path)) {
                 delete sectionState[path];
                 purgedPaths?.add(path);
+                isStateChanged = true;
             }
         }
     }
@@ -135,10 +143,16 @@ const purgeYasmState = (
         store.pathRegistry[name] = registeredPaths.filter(path => {
             if (matches(path)) {
                 purgedPaths?.add(path);
+                isStateChanged = true;
                 return false;
             }
             return true;
         });
+    }
+
+    // 🔒 Notify the store to trigger persistence and listeners if data was actually purged
+    if (isStateChanged) {
+        store[SYMBOL_NOTIFY_CHANGE]();
     }
 
     if (shouldLog) {
@@ -149,7 +163,7 @@ const purgeYasmState = (
 
         if (purgeScope === 'full') {
             console.debug('after purge:');
-            snapshot(store.state, store.debugOptions);
+            snapshot(store.state, store);
         }
 
         console.debug('--------');
