@@ -285,7 +285,7 @@ The setter cache is keyed by the updater function — and YASM keeps the updater
 > }
 > ```
 >
-> With the flag enabled, the assignment above becomes a **compile-time error**, while fields that are *genuinely* nullable (`age?: number | undefined`) remain fully assignable. This is the single most important tsconfig flag for YASM users.
+> With the flag enabled, the assignment above becomes a **compile-time error**, while fields that are _genuinely_ nullable (`age?: number | undefined`) remain fully assignable. This is the single most important tsconfig flag for YASM users.
 
 ### Selectors & Overrides
 
@@ -853,37 +853,54 @@ YASM also drops sections that no longer exist in the current `sectionMap` and fi
 
 ### Migrations (Application-Specific)
 
+**Why migrations exist at all**: persisted state outlives your deployments. The snapshot in your storage (e.g., IndexedDB via `localforage`) is restored on every page reload, so a user can boot today's app with data that was written weeks ago — by an older version of your sections, shaped by an older schema. Migrations bring those stored values forward to the current schema, so a refresh never costs the user their state.
+
 Normalization covers the common "add / remove field" cases. For renames, type changes, or any other structural transformation, you need a real migration.
+
+**When you must write a migration:**
+
+- ✅ **Renaming a field** of a section → migrate the old name to the new one.
+- ✅ **Changing a field's type** (e.g. `string` date → `Date`) → convert the stored value.
+- ❌ **Adding or removing a field** → no migration needed — normalization fills added fields from `initialState` and prunes removed ones on every hydration.
 
 **Use `migrations`**. YASM natively manages schema tracking and prevents duplicate executions. Migrations are mapped directly to specific Sections.
 
-Recommended pattern (idempotent, per-section, tracked by ID):
+⚠️ **Typing tip — avoid a circular inference trap**: if you type your migrations constant with `keyof typeof store.sectionMap` and pass that same constant into `createStore`, TypeScript hits a circular reference and both collapse to `any`. Derive the type from a named section map instead:
 
 ```ts
-import { type StateMigration } from '@mrnafisia/yasm';
+import { createStore, type StateMigration } from '@mrnafisia/yasm';
 
+// 1. Name the section map so its type can be derived BEFORE the store exists
+const APP_SECTIONS = {
+    TransactionManage: transactionManageSection
+    // ...your sections
+};
+
+// 2. Type migrations from the section map — not from `store`
 const APP_STATE_MIGRATIONS: Partial<
-    Record<keyof typeof store.sectionMap, StateMigration[]>
+    Record<keyof typeof APP_SECTIONS, StateMigration[]>
 > = {
     TransactionManage: [
         {
             id: '2026-04-27T13:02:00.000Z',
-            migrate: stateValue => {
+            migrate: storedValue => {
                 // Rename
-                if ('loading' in stateValue) {
-                    stateValue.isLoading = stateValue.loading;
-                    delete stateValue.loading;
+                if ('loading' in storedValue) {
+                    storedValue.isLoading = storedValue.loading;
+                    delete storedValue.loading;
                 }
+
                 // Type change
-                if (typeof stateValue.date === 'string') {
-                    stateValue.date = new Date(stateValue.date);
+                if (typeof storedValue.date === 'string') {
+                    storedValue.date = new Date(storedValue.date);
                 }
             }
         }
     ]
 };
 
-const store = createStore(sectionMap, {
+// 3. Create the store from the same named map
+const store = createStore(APP_SECTIONS, {
     persist: {
         key: 'yasmState',
         storage,
@@ -895,7 +912,8 @@ const store = createStore(sectionMap, {
 
 **Notes:**
 
-- Keep migration IDs unique across the whole application.
+- Migration ids must be unique **within a section** — YASM validates this at `createStore` and throws on duplicates (a duplicate id would be silently skipped during hydration, since executed-tracking is keyed by `${sectionName}/${id}`). Keeping ids globally unique is still good hygiene; the ISO date convention makes that easy: use the ISO date string of the change, optionally prefixed with a short description for context — `'2026-04-27T13:02:00.000Z'` or `'delete-legacy-loading/2026-04-27T13:02:00.000Z'` — ids then sort chronologically in the persisted metadata.
+- The `migrate` callback receives the stored value typed as `Record<string, unknown>` — **intentionally**, since the data was written by an older schema. Guard field accesses with `in` / `typeof` (as in the example above); typing migrations against the section's *current* shape breaks rename flows at compile time. You can still opt into a concrete type with `StateMigration<MySectionState>`.
 - Migrations must be idempotent; they may run again after a hard reload if the bookkeeping entry is lost.
 - On a fresh install (empty storage), every configured migration is immediately marked as executed—natively created state already matches the current schema.
 - A migration that produces fields absent from the section's `initialState` will see them pruned afterwards by default normalization (`pruneStaleFields: true`).

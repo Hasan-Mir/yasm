@@ -1424,3 +1424,48 @@ test('persistence: normalization fills fields missing from the stored snapshot',
     assert.equal(state.text, ''); // missing fields filled from initialState
     assert.equal(state.isLoading, false);
 });
+
+test('persistence: duplicate migration ids within a section throw at store creation', () => {
+    const storage = createMockStorage();
+    const migrate = () => {
+        // migrations never run in this test
+    };
+
+    assert.throws(
+        () =>
+            createStore(
+                { Dummy: dummySection },
+                {
+                    persist: {
+                        key: 'test-key',
+                        storage,
+                        migrations: {
+                            Dummy: [
+                                { id: 'same', migrate },
+                                { id: 'same', migrate }
+                            ]
+                        }
+                    }
+                }
+            ),
+        /duplicate migration id "same" in section "Dummy"/
+    );
+
+    // The same id in a DIFFERENT section is fine — executed-tracking keys
+    // include the section name.
+    assert.doesNotThrow(() =>
+        createStore(
+            { One: dummySection, Two: dummySection },
+            {
+                persist: {
+                    key: 'test-key',
+                    storage,
+                    migrations: {
+                        One: [{ id: 'same', migrate }],
+                        Two: [{ id: 'same', migrate }]
+                    }
+                }
+            }
+        )
+    );
+});

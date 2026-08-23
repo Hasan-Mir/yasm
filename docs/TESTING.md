@@ -145,6 +145,8 @@ logged, and never reject `hydrate()`/`save()`.
   function debounce delays; browser idle callback and timer fallback.
 - Normalization enabled/default, disabled, `pruneStaleFields: false`, all three
   transient mechanisms, migrations, and lifecycle hooks.
+- Duplicate migration ids within a section throw at store creation; the same
+  id reused in different sections is allowed.
 - Invalid persisted JSON, primitive/null snapshots, missing state/registry,
   storage/hook failures, unknown routing sections, malformed route paths, and
   missing routed elements.

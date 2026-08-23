@@ -241,12 +241,59 @@ type NormalizationConfig<SM extends Record<Name, Section>> = {
 /**
  * A one-time schema transformation for one section, executed per stored
  * path value during hydration (before `onBeforeHydrate` and normalization).
+ *
+ * When you need a migration:
+ * - ✅ Renaming a field of a section — you MUST write a migration.
+ * - ✅ Changing the type of a field — you MUST write a migration.
+ * - ❌ Adding or removing a field — no migration needed; normalization
+ *   fills added fields from `initialState` and prunes removed ones.
+ *
  * Migrations must be idempotent — they may re-run if the bookkeeping
  * metadata is ever lost.
+ *
+ * @example
+ * const APP_STATE_MIGRATIONS = {
+ *     TransactionManage: [
+ *         {
+ *             id: '2026-04-27T13:02:00.000Z',
+ *             migrate: storedValue => {
+ *                 // Rename `loading` → `isLoading`
+ *                 if ('loading' in storedValue) {
+ *                     storedValue.isLoading = storedValue.loading;
+ *                     delete storedValue.loading;
+ *                 }
+ *
+ *                 // Change the type of `date` from `string` to `Date`
+ *                 if (typeof storedValue.date === 'string') {
+ *                     storedValue.date = new Date(storedValue.date);
+ *                 }
+ *             }
+ *         }
+ *     ]
+ * };
  */
 type StateMigration<S = Record<string, unknown>> = {
+    /**
+     * A unique identifier: the ISO date string of the change, optionally
+     * prefixed with a short description for context.
+     *
+     * @example
+     * '2026-04-27T13:02:00.000Z'
+     * 'delete-legacy-loading/2026-04-27T13:02:00.000Z'
+     */
     id: string;
-    migrate: (state: S) => void | Promise<void>;
+
+    /**
+     * A mutative callback receiving one stored path value of the section —
+     * mutate it in place; the return value is ignored.
+     *
+     * 💡 By default `storedValue` is typed `Record<string, unknown>` (via
+     * the generic default). This is intentional: the stored data was written
+     * by an *older* schema, so treat it as an opaque record and guard field
+     * accesses with `in` / `typeof`. Only instantiate `StateMigration<S>`
+     * with your section's current type when you knowingly want that shape.
+     */
+    migrate: (storedValue: S) => void | Promise<void>;
 };
 
 /**
@@ -311,9 +358,16 @@ type PersistConfig<SM extends Record<Name, Section>> = {
     /**
      * Managed schema migrations engine.
      * Executed automatically on hydration before `onBeforeHydrate` and normalization.
+     *
+     * 💡 Migrations receive the stored value typed as `Record<string, unknown>`
+     * (the default `StateMigration`). The stored data predates the current
+     * schema — that is why the migration exists — so typing it as the current
+     * `initialState` would be a lie and breaks rename flows at compile time.
+     * Opt into a concrete type with `StateMigration<MySectionState>` only when
+     * you knowingly want the current shape.
      */
     migrations?: Partial<{
-        [K in keyof SM]: StateMigration<SM[K]['initialState']>[];
+        [K in keyof SM]: StateMigration[];
     }>;
 
     /**
@@ -464,6 +518,27 @@ const createStore = <SM extends Record<Name, Section>>(
         boundaryChars = options.pathBoundaryChars(DEFAULT_PATH_BOUNDARY_CHARS);
     } else if (Array.isArray(options?.pathBoundaryChars)) {
         boundaryChars = options.pathBoundaryChars;
+    }
+
+    // 🛡️ Executed migrations are tracked by `${sectionName}/${id}`, so a
+    // duplicate id would make every migration after the first one with that
+    // id be silently skipped during hydration (the metadata already marks it
+    // as executed). Fail fast at store creation instead of corrupting data.
+    const migrationsConfig = options?.persist?.migrations;
+    if (migrationsConfig !== undefined) {
+        for (const [sectionName, sectionMigrations] of Object.entries(
+            migrationsConfig
+        )) {
+            const seenIds = new Set<string>();
+            for (const migration of sectionMigrations ?? []) {
+                if (seenIds.has(migration.id)) {
+                    throw new Error(
+                        `YASM: duplicate migration id "${migration.id}" in section "${sectionName}". Migration ids must be unique within a section — duplicates would be silently skipped during hydration.`
+                    );
+                }
+                seenIds.add(migration.id);
+            }
+        }
     }
 
     let counter = 0;
@@ -726,6 +801,7 @@ const createStore = <SM extends Record<Name, Section>>(
                                 ] of Object.entries(p.migrations)) {
                                     const storedSection =
                                         parsed.state[sectionName];
+
                                     const pendingMigrations = (
                                         sectionMigrations as StateMigration[]
                                     ).filter(
@@ -978,6 +1054,7 @@ const createStore = <SM extends Record<Name, Section>>(
                         const migrationEntries = Object.entries(
                             p.migrations
                         ) as [string, StateMigration[]][];
+
                         for (const [
                             sectionName,
                             sectionMigrations
