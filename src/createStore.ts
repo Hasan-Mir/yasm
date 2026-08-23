@@ -458,7 +458,7 @@ type Store<SM extends Record<Name, Section> = Record<Name, Section>> = {
     sectionMap: SM;
 
     /** Low-level subscription used by `useSyncExternalStore` (via `init`). */
-    subscribe: (callback: () => void, name: keyof SM, path: Path) => () => void;
+    subscribe(callback: () => void, name: keyof SM, path: Path): () => void;
 
     /** Registered parent paths per routing section; persisted with the store so hydration can restore routing. */
     pathRegistry: Record<Name, Path[]>;
