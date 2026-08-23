@@ -18,6 +18,10 @@ const immer = new Immer();
  * check would match `/tabs/10` too, which caused states of *other* tabs to be
  * purged (and their routing to be hijacked) whenever more than 9 tabs were
  * open.
+ *
+ * @param path - The path to test.
+ * @param prefix - The prefix to test against; `''` matches every path.
+ * @param boundaryChars - Characters that mark the start of a new segment.
  */
 const isPathWithinPrefix = (
     path: string,
@@ -54,6 +58,10 @@ const isPathWithinPrefix = (
 };
 
 // updaters
+/**
+ * A strict `{ key, value }` pair for one property of `T` — the payload
+ * shape consumed by `propertyUpdaterGenerator`.
+ */
 type UpdatingKeyAndValue<T extends Record<string, unknown>> = {
     [key in keyof T]: {
         key: key;
@@ -61,6 +69,11 @@ type UpdatingKeyAndValue<T extends Record<string, unknown>> = {
     };
 }[keyof T];
 
+/**
+ * Creates an updater that sets a single property via a `{ key, value }`
+ * payload. Setting an unchanged value returns the same state reference,
+ * making the update a no-op (no notifications, no autosave).
+ */
 const propertyUpdaterGenerator =
     <S extends Record<string, unknown>>() =>
     (state: S, { key, value }: UpdatingKeyAndValue<S>) =>
@@ -71,6 +84,20 @@ const propertyUpdaterGenerator =
                   [key]: value
               };
 
+/**
+ * Creates an updater that shallow-merges a `Partial<S>` payload into the
+ * state. A payload whose every value is already current returns the same
+ * state reference, making the update a no-op (no notifications, no
+ * autosave).
+ *
+ * ⚠️ IMPORTANT — enable `exactOptionalPropertyTypes` in your tsconfig! The
+ * payload is `Partial<S>`, and under TypeScript's default settings optional
+ * properties also accept an *explicit* `undefined`. That means
+ * `updateState({ age: undefined })` compiles even when `age: number`,
+ * silently corrupting your state at runtime. With the flag enabled it
+ * becomes a compile-time error, while genuinely nullable fields
+ * (`age: number | undefined`) remain assignable.
+ */
 const mergeUpdaterGenerator =
     <S extends Record<string, unknown>>() =>
     (state: S, payload: Partial<S>) =>
@@ -82,6 +109,11 @@ const mergeUpdaterGenerator =
               };
 
 // Array composition
+/**
+ * The section signature built by `arraySectionGenerator`: a parent whose
+ * state is an ordered map (`{ order, map }`) of child instances, with
+ * add/edit/remove/order payload operations and `[id]` child routing.
+ */
 type ArraySection<S, P> = Section<
     {
         order: number[];
@@ -95,6 +127,11 @@ type ArraySection<S, P> = Section<
     }
 >;
 
+/**
+ * Parses the leading `[index]` of an ArraySection path query and returns
+ * `[index, remainedPathQuery]`, or an error string when the query is
+ * malformed (missing brackets, empty `[]`, negative or non-integer index).
+ */
 const extractArrayIndexAndRemainedPathQuery = (
     pathQuery: string
 ): [index: number, remainedPathQuery: string] | string => {
@@ -113,6 +150,21 @@ const extractArrayIndexAndRemainedPathQuery = (
     return 'invalid ArraySection path!';
 };
 
+/**
+ * Builds a composed parent section whose state is an ordered map of child
+ * states: `{ order: number[]; map: Record<number, S> }`.
+ *
+ * The parent updater payload supports `order`, `removingIDs`, `addingItems`
+ * and `editingItems` (applied in that order), and the generated `routing`
+ * lets child hooks address single rows through `[id]` path queries (e.g.
+ * `useYasmState('UserRow', '/users[7]')`). The generated `normalize` hook
+ * heals corrupted persisted data and applies child-level transient rules
+ * during hydration.
+ *
+ * @param sectionName - The child section name; must be registered in
+ *   `createStore` under the same name.
+ * @param baseSection - The child section definition used for each row.
+ */
 const arraySectionGenerator = <S, P>(
     sectionName: Name,
     baseSection: Section<S, P>
@@ -270,15 +322,28 @@ const arraySectionGenerator = <S, P>(
 });
 
 // Object composition
+/** The child definition shape accepted by `objectSectionGenerator` per entry. */
 type SectionWithName = { name: Name; state: any; updater: Updater };
+
+/** Maps each child definition of an `objectSectionGenerator` map to its state type. */
 type ObjectSectionState<SM extends Record<string, SectionWithName>> = {
     [key in keyof SM]: SM[key]['state'];
 };
+
+/**
+ * The section signature built by `objectSectionGenerator`: a parent composed
+ * of named child sections, addressable through `[childKey]` routing.
+ */
 type ObjectSection<SM extends Record<string, SectionWithName>> = Section<
     ObjectSectionState<SM>,
     { [key in keyof SM]?: Parameters<SM[key]['updater']>[1] }
 >;
 
+/**
+ * Parses the leading `[key]` of an ObjectSection path query and returns
+ * `[key, remainedPathQuery]`, or an error string when the query is
+ * malformed (missing brackets or empty `[]`).
+ */
 const extractObjectIndexAndRemainedPathQuery = (
     pathQuery: string
 ): [index: string, remainedPathQuery: string] | string => {
@@ -295,6 +360,17 @@ const extractObjectIndexAndRemainedPathQuery = (
     return 'invalid ObjectSection path!';
 };
 
+/**
+ * Builds a composed parent section from named child definitions (one
+ * `{ name, state, updater }` entry per child key). Children are addressed
+ * through `[childKey]` path queries (e.g.
+ * `useYasmState('Profile', '/form[profile]')`) and update immutably inside
+ * the parent state. Each child must also be registered in `createStore`
+ * under the same name used in the map.
+ *
+ * @param sectionMap - Local key → child definition. The child `name` of
+ *   each entry must match its registered section name.
+ */
 const objectSectionGenerator = <SM extends Record<string, SectionWithName>>(
     sectionMap: SM
 ): ObjectSection<SM> => ({
@@ -399,6 +475,12 @@ const fieldSettersCache = new WeakMap<
     >
 >();
 
+/**
+ * Returns a cached setter for one field of a section, built on top of its
+ * updater. The setter accepts a value or a `(prev) => next` callback, and
+ * the cache keeps the function reference stable per `(updateState, field)`
+ * pair — safe for React dependency arrays.
+ */
 function getFieldSetter<TSection, TField extends keyof TSection>(
     updateState: (
         payload: Partial<TSection> | ((state: TSection) => Partial<TSection>)
@@ -459,6 +541,9 @@ function isRawObject(value: unknown): value is Record<PropertyKey, unknown> {
     );
 }
 
+// Replaces `undefined` values with a placeholder so they survive the JSON
+// round-trip inside debug snapshots (persistence drops them naturally and
+// re-fills them from `initialState` during normalization).
 function preEncode(value: unknown): unknown {
     if (value === undefined) {
         return UNDEFINED_PLACEHOLDER;
@@ -479,6 +564,7 @@ function preEncode(value: unknown): unknown {
     return value;
 }
 
+// Restores placeholder objects produced by `preEncode` back into real`undefined` values.
 function postDecode(value: unknown): unknown {
     if (Array.isArray(value)) {
         return value.map(postDecode);
@@ -499,6 +585,11 @@ function postDecode(value: unknown): unknown {
     return value;
 }
 
+/**
+ * Logs a debug snapshot of `obj` to the console, round-tripping it through
+ * the store's serializer/deserializer and preserving `undefined` values (via
+ * a placeholder) so the logged copy matches what persistence would store.
+ */
 const snapshot = (
     obj: Record<string, unknown>,
     storeOptions: StoreOptions<any>

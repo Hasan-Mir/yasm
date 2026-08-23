@@ -1,8 +1,20 @@
 type Name = string;
 type Path = string;
 
+/**
+ * A mini-reducer for one section: receives the current state (an Immer
+ * draft) and the payload, and either mutates the draft or returns a new
+ * state. Returning the exact same reference (or leaving the draft untouched)
+ * makes the update a silent no-op — no notifications, no re-renders, no
+ * autosave.
+ */
 type Updater<S = any, P = any> = (state: S, payload: P) => S | void;
 
+/**
+ * Either a raw payload for the section updater, or a payload creator — a
+ * callback that receives the *latest* state at dispatch time and returns
+ * the payload (avoids stale closures).
+ */
 type PayloadAndPayloadCreator<
     SM extends Record<Name, Section>,
     N extends keyof SM
@@ -10,6 +22,20 @@ type PayloadAndPayloadCreator<
     | Parameters<SM[N]['updater']>[1]
     | ((state: SM[N]['initialState']) => Parameters<SM[N]['updater']>[1]);
 
+/**
+ * Routes a child section's reads/writes into a parent section's state.
+ *
+ * - `selectByPathQuery`: resolves the child state for a relative path
+ *   query (e.g. `'[7]'`), returning the child state and the remaining query.
+ * - `updateByPathQuery`: applies `getValue` to the child state addressed by
+ *   the query and returns the new *parent* state immutably. Returning the
+ *   unchanged parent state aborts the whole update (reference-equality
+ *   fast path).
+ *
+ * Any remaining query returned by `selectByPathQuery` is passed on to the
+ * child section's own routing — so routers compose recursively and
+ * multi-level nesting works.
+ */
 type Router<S = any, NS = any> = {
     selectByPathQuery: (
         state: S,
@@ -22,20 +48,25 @@ type Router<S = any, NS = any> = {
     ) => S;
 };
 
+/** Maps a child section name to the `Router` that addresses it inside this section. */
 type Routing<S = any> = Record<Name, Router<S>>;
 
+/** The full store state grid: `state[sectionName][path]` holds one instance's value. */
 type StateBySectionMap<SM extends Record<Name, Section>> = {
     [name in keyof SM]: Record<Path, SM[name]['initialState']>;
 };
 
+/** Listener callbacks per `(section, path)`, keyed by subscription id. */
 type SubscribersBySectionMap<SM extends Record<Name, Section>> = {
     [name in keyof SM]: Record<Path, Record<number, () => void>>;
 };
 
+/** Maps a child section name to the parent sections that route into it. */
 type RoutingPlan<SM extends Record<Name, Section>> = {
     [name in keyof SM]: Name[];
 };
 
+/** Memoized `{ subscribe, getState, updater }` plumbing per `(section, path)`. */
 type Memo<SM extends Record<Name, Section>> = {
     [name in keyof SM]: Record<
         Path,
@@ -47,6 +78,12 @@ type Memo<SM extends Record<Name, Section>> = {
     >;
 };
 
+/**
+ * Passed to a section's `normalize` hook during hydration, so composed
+ * structures can normalize their children consistently with the global
+ * normalization config (`defaultNormalize` applies the same transient and
+ * pruning rules to any child value).
+ */
 type NormalizationContext = {
     pruneStaleFields: boolean;
     defaultNormalize: (
@@ -59,26 +96,70 @@ type NormalizationContext = {
 type Section<S = any, P = any> = {
     initialState: S;
     updater: Updater<S, P>;
+
+    /**
+     * Declares this section as a routing parent: other ("child") sections
+     * can store their state *inside* this section's state and address it
+     * through path queries (e.g. `useYasmState('UserRow', '/users[7]')`
+     * reads/writes row 7 stored inside the `UserTable` section).
+     *
+     * Each entry maps a child section name to a `Router` providing:
+     * - `selectByPathQuery(state, pathQuery)` — resolves the child state.
+     * - `updateByPathQuery(state, pathQuery, getValue)` — updates the child
+     *   immutably and returns the new parent state.
+     *
+     * You rarely define this by hand — `arraySectionGenerator` and
+     * `objectSectionGenerator` build routing parents for you.
+     *
+     * ⚠️ Registered parent paths must not be nested within each other
+     * (one path cannot be a segment-prefix of another); YASM reports
+     * violations in development.
+     */
     routing?: Routing<S>;
+
     /**
      * An optional hook to perform deep normalization for composed structures.
-     * Generators like `arraySectionGenerator` use this to normalize child elements.
+     * It is executed automatically during store hydration to ensure restored
+     * data matches the current schema. Generators like `arraySectionGenerator`
+     * use this to normalize their nested child elements.
      */
     normalize?: (storedValue: any, context: NormalizationContext) => S;
+
+    /**
+     * Determines whether this section should be persisted to storage.
+     * When `false`, all data of this section and its path registry entries
+     * are excluded from the persistence process.
+     * @default true
+     */
+    persist?: boolean;
 };
 
-type DebugOptions = {
+/**
+ * Describes a state change, passed to the `logStateUpdates` filter callback.
+ *
+ * - `update`: the section path was updated with `payload` (already resolved
+ *   when a payload creator was used).
+ * - `purge`: every path matching `pathPrefix` is being purged.
+ */
+type LogEvent<SM extends Record<Name, Section> = Record<Name, Section>> =
+    | { type: 'update'; sectionName: keyof SM; path: Path; payload: unknown }
+    | { type: 'purge'; pathPrefix: string };
+
+type DebugOptions<SM extends Record<Name, Section> = Record<Name, Section>> = {
     /**
-     * When `true` (and `process.env.NODE_ENV !== 'production'`), YASM logs
-     * state changes during updates and purges.
+     * Controls console logging for state mutations and purges in development.
      *
-     * Note: Depending on your `snapshotScope` and
-     * `purgeSnapshotScope` settings, logging can serialize large parts of
-     * the store, which may cause performance overhead in development.
+     * - `true`: Logs every update and purge.
+     * - `false`: Disables logging.
+     * - `(event) => boolean`: A filter callback to narrow down logs to specific
+     *   sections, paths, or event types (highly recommended for busy apps).
+     *
+     * Note: Depending on your `snapshotScope` and `purgeSnapshotScope` settings,
+     * logging can serialize large parts of the store, causing performance overhead.
      *
      * @default false
      */
-    logStateUpdates?: boolean;
+    logStateUpdates?: boolean | ((event: LogEvent<SM>) => boolean);
 
     /**
      * Determines the scope of the state snapshot when `logStateUpdates` is enabled
@@ -108,6 +189,11 @@ type DebugOptions = {
     purgeSnapshotScope?: 'none' | 'full';
 };
 
+/**
+ * A minimal key-value storage engine. Every method may be synchronous or
+ * asynchronous (YASM awaits results where needed) — `localStorage`,
+ * `localforage`, `AsyncStorage`, or a custom adapter all fit this shape.
+ */
 type YasmPersistenceAdapter = {
     getItem: (key: string) => Promise<string | null> | string | null;
     setItem: (key: string, value: string) => Promise<void> | void;
@@ -152,11 +238,21 @@ type NormalizationConfig<SM extends Record<Name, Section>> = {
     isTransient?: (sectionName: keyof SM, fieldName: string) => boolean;
 };
 
+/**
+ * A one-time schema transformation for one section, executed per stored
+ * path value during hydration (before `onBeforeHydrate` and normalization).
+ * Migrations must be idempotent — they may re-run if the bookkeeping
+ * metadata is ever lost.
+ */
 type StateMigration<S = Record<string, unknown>> = {
     id: string;
     migrate: (state: S) => void | Promise<void>;
 };
 
+/**
+ * The exact shape YASM writes to (and reads from) storage: the per-section
+ * state grid, the routing path registry, and bookkeeping metadata.
+ */
 type PersistedSnapshot<SM extends Record<Name, Section>> = {
     state: Partial<StateBySectionMap<SM>>;
     pathRegistry: Partial<Record<Name, Path[]>>;
@@ -175,6 +271,9 @@ type PersistConfig<SM extends Record<Name, Section>> = {
     /**
      * Section names to explicitly exclude from persistence.
      * Can be a static array or a callback that returns an array based on the current state.
+     *
+     * 💡 Tip: For statically omitting a section, it is often cleaner to simply
+     * set `persist: false` directly on the `Section` definition itself!
      *
      * @example
      * omitSections: ['BaseInfo', 'TemporaryUI']
@@ -202,6 +301,10 @@ type PersistConfig<SM extends Record<Name, Section>> = {
     /**
      * Hook triggered right before the state is serialized and saved.
      * Provides the snapshot (omissions applied) that is about to be saved.
+     *
+     * ⚠️ WARNING: The objects inside `snapshot.state` are references shared with
+     * the live React store. Treat this snapshot as STRICTLY READ-ONLY. Mutating
+     * it here will cause severe UI bugs.
      */
     onBeforeSave?: (snapshot: PersistedSnapshot<SM>) => void | Promise<void>;
 
@@ -242,7 +345,8 @@ type PersistConfig<SM extends Record<Name, Section>> = {
 };
 
 type StoreOptions<SM extends Record<Name, Section>> = {
-    debugOptions?: DebugOptions;
+    /** Dev-only diagnostics: state logging and snapshot scopes (see `DebugOptions`). */
+    debugOptions?: DebugOptions<SM>;
 
     /**
      * Characters that mark the start of a new segment inside a YASM path,
@@ -281,14 +385,37 @@ type StoreOptions<SM extends Record<Name, Section>> = {
 
 const SYMBOL_NOTIFY_CHANGE = Symbol('YASM_NOTIFY_CHANGE');
 
+/**
+ * The store instance returned by `createStore`.
+ *
+ * `state`, `pathRegistry`, `hydrate()`, and `save()` are the supported
+ * public surface. `subscribers`, `memo`, and `routingPlan` are internal
+ * plumbing, exposed for advanced/manual usage and tests — avoid relying on
+ * them in application code.
+ */
 type Store<SM extends Record<Name, Section> = Record<Name, Section>> = {
+    /** The live state grid: `state[sectionName][path]` → instance value. */
     state: StateBySectionMap<SM>;
+
+    /** Active listener callbacks per `(section, path)`, keyed by id. */
     subscribers: SubscribersBySectionMap<SM>;
+
+    /** The section map this store was created with. */
     sectionMap: SM;
+
+    /** Low-level subscription used by `useSyncExternalStore` (via `init`). */
     subscribe: (callback: () => void, name: keyof SM, path: Path) => () => void;
+
+    /** Registered parent paths per routing section; persisted with the store so hydration can restore routing. */
     pathRegistry: Record<Name, Path[]>;
+
+    /** Derived once from section `routing` declarations: child name → parent section names. */
     routingPlan: RoutingPlan<SM>;
+
+    /** Memoized `{ subscribe, getState, updater }` plumbing per `(section, path)`. */
     memo: Memo<SM>;
+
+    /** Characters that mark the start of a new path segment (default `'/'`, `'['`, `'.'`). */
     pathBoundaryChars: string[];
 
     /**
@@ -309,11 +436,24 @@ type Store<SM extends Record<Name, Section> = Record<Name, Section>> = {
      */
     [SYMBOL_NOTIFY_CHANGE]: () => void;
 } & Required<
-    Pick<StoreOptions<any>, 'serializer' | 'deserializer' | 'debugOptions'>
+    Pick<StoreOptions<SM>, 'serializer' | 'deserializer' | 'debugOptions'>
 >;
 
+/** The default path segment boundaries: `'/'`, `'['` and `'.'`. */
 const DEFAULT_PATH_BOUNDARY_CHARS = ['/', '[', '.'];
 
+/**
+ * Creates a YASM store from a section map.
+ *
+ * @param sectionMap - Section definitions keyed by name. Composition/routing
+ *   parents (e.g. from `arraySectionGenerator`) *and* their children must
+ *   all be registered here.
+ * @param options - Persistence, debugging, path boundaries, serialization,
+ *   and change-callback configuration.
+ * @returns The store. Provide it via `YasmContext.Provider`; when
+ *   persistence is configured, call `store.hydrate()` once before mounting
+ *   any consumers.
+ */
 const createStore = <SM extends Record<Name, Section>>(
     sectionMap: SM,
     options?: StoreOptions<SM>
@@ -383,6 +523,7 @@ const createStore = <SM extends Record<Name, Section>>(
                 }
             };
         },
+
         pathRegistry: names.reduce(
             (pre, name) => {
                 if (sectionMap[name].routing !== undefined) {
@@ -392,6 +533,7 @@ const createStore = <SM extends Record<Name, Section>>(
             },
             {} as Record<Name, Path[]>
         ),
+
         routingPlan: names.reduce((pre, name) => {
             const routing = sectionMap[name].routing;
             if (routing !== undefined) {
@@ -413,10 +555,12 @@ const createStore = <SM extends Record<Name, Section>>(
             }
             return pre;
         }, {} as RoutingPlan<SM>),
+
         memo: names.reduce((pre, name) => {
             pre[name] = {};
             return pre;
         }, {} as Memo<SM>),
+
         pathBoundaryChars: boundaryChars,
         serializer: options?.serializer ?? ((_, __, value) => value),
         deserializer: options?.deserializer ?? ((_, value) => value),
@@ -450,6 +594,15 @@ const createStore = <SM extends Record<Name, Section>>(
                 typeof p.omitSections === 'function'
                     ? p.omitSections(this.state)
                     : p.omitSections || [];
+
+            Object.entries(this.sectionMap).forEach(([key, section]) => {
+                if (
+                    section.persist === false &&
+                    !omittedSections.includes(key as keyof SM)
+                ) {
+                    omittedSections.push(key as keyof SM);
+                }
+            });
 
             const stateToSave: Partial<StateBySectionMap<SM>> = {};
             const pathRegistryToSave: Partial<Record<Name, Path[]>> = {};

@@ -72,13 +72,151 @@ const Counter = ({ path }: { path: string }) => {
 };
 ```
 
+💡 In real applications you will usually wrap `useYasmState` in a strongly-typed app hook so that section names, states, and payloads are fully typed — see **💎 TypeScript: Strongly Typed Hooks** below.
+
+---
+
+## 💎 TypeScript: Strongly Typed Hooks
+
+The Quick Start calls `useYasmState` directly — perfectly fine for demos. In a real app, however, TypeScript **cannot infer your section types** from the call site. The reason is simple: the hook never receives your section map. Your store is created _outside_ the component tree (in `store.ts`), and the hook only receives loose `string` arguments, so the generics fall back to their wide defaults — section names are plain strings and the state is untyped.
+
+The industry-standard solution is a **typed wrapper hook**: create your store once, derive its `SectionMap` type, and re-export a thin `useAppState` hook bound to it.
+
+Why the one-time setup is worth it:
+
+- 🧠 **Full inference** — state, selector results, updater payloads, and `overrideInitialState` are precisely typed per section.
+- ✍️ **Autocomplete & typo safety** — section names autocomplete in the IDE; a typo like `'Couter'` becomes a compile-time error instead of a runtime surprise.
+- 🧩 **One source of truth** — the wrapper is the single place where your app's store type enters the React layer.
+
+Create the wrapper next to your store definition (e.g. `src/store/hooks.ts`):
+
+```ts
+import { useYasmState } from '@mrnafisia/yasm';
+import { store } from './index';
+
+// 1. Derive the section map type from the initialized store
+type SectionMap = typeof store.sectionMap;
+
+type Updater<Name extends keyof SectionMap> = (
+    payload:
+        | Parameters<SectionMap[Name]['updater']>[1]
+        | ((
+              state: SectionMap[Name]['initialState']
+          ) => Parameters<SectionMap[Name]['updater']>[1])
+) => SectionMap[Name]['initialState'] | void;
+
+type OverrideInitialState<Name extends keyof SectionMap> =
+    | Partial<SectionMap[Name]['initialState']>
+    | ((
+          initialState: SectionMap[Name]['initialState']
+      ) => Partial<SectionMap[Name]['initialState']>);
+
+// 2. Overload 1: basic use (no selector) or use with a selector
+function useAppState<Name extends keyof SectionMap, State>(
+    name: Name,
+    path: string,
+    selector?: (state: SectionMap[Name]['initialState']) => State
+): [
+    unknown extends State ? SectionMap[Name]['initialState'] : State,
+    Updater<Name>
+];
+
+// 3. Overload 2: use with an options object (selector and/or overrideInitialState)
+function useAppState<Name extends keyof SectionMap, State>(
+    name: Name,
+    path: string,
+    options: {
+        selector?: (state: SectionMap[Name]['initialState']) => State;
+        overrideInitialState?: OverrideInitialState<Name>;
+    }
+): [
+    unknown extends State ? SectionMap[Name]['initialState'] : State,
+    Updater<Name>
+];
+
+// 4. Implementation signature: delegate to useYasmState and retype the result
+function useAppState<Name extends keyof SectionMap, State>(
+    name: Name,
+    path: string,
+    thirdParam?:
+        | ((state: SectionMap[Name]['initialState']) => State)
+        | {
+              selector?: (state: SectionMap[Name]['initialState']) => State;
+              overrideInitialState?: OverrideInitialState<Name>;
+          }
+) {
+    return useYasmState(
+        name,
+        path,
+        thirdParam as Parameters<typeof useYasmState>[2]
+    ) as [
+        unknown extends State ? SectionMap[Name]['initialState'] : State,
+        Updater<Name>
+    ];
+}
+```
+
+Now replace every `useYasmState` call in your components with `useAppState`:
+
+```ts
+const [count, update] = useAppState('Counter', '/tabs/1/counter', s => s.count);
+//                                    ^^^^^^^^^ autocompletes
+update({ count: 5 }); // ✅ payload fully typed
+update({ cont: 5 }); // ❌ compile-time error
+```
+
+### Write-Only Access (`useYasmStateUpdater`)
+
+Many components only _dispatch_ — submit buttons, toolbar actions, debounced savers — and never read the state they write to. They should not re-render when that state changes.
+
+YASM ships a hook for exactly this. `useYasmStateUpdater` returns only the updater and **never subscribes** the calling component — the store does not even notify it when the state changes, so it cannot re-render:
+
+```tsx
+import { useYasmStateUpdater } from '@mrnafisia/yasm';
+
+const resetCounter = useYasmStateUpdater('Counter', '/tabs/1/counter');
+
+// This button renders once and never re-renders, even if the counter
+// updates a thousand times per second:
+<button onClick={() => resetCounter({ count: 0 })}>Reset</button>;
+```
+
+For fully typed access (autocomplete + typed payloads), forward it through your app's `SectionMap`:
+
+```ts
+const useAppStateUpdater = <Name extends keyof SectionMap>(
+    name: Name,
+    path: string
+) => useYasmStateUpdater<SectionMap, Name>(name, path);
+```
+
+How it works — and the manual alternative: every component subscribed to a `(section, path)` is notified after each update, and React re-renders it unless the selected value is reference-equal to the previous one. With raw `useYasmState` you can opt out of re-renders by passing the constant selector `() => null` and destructuring only the updater. The component stays subscribed, but React always bails out because the selected `null` never changes:
+
+```ts
+const [, update] = useYasmState('Counter', '/tabs/1/counter', () => null);
+```
+
+> ⚠️ **Warning**: If you destructure the state anyway (`const [state, update] = useYasmState(...)`), the component subscribes to the full state at that path and re-renders on every change of it — even if `state` is never read. Destructure only the updater (`const [, update] = ...`) or use `useYasmStateUpdater`.
+
 ---
 
 ## 🧠 Core Concepts
 
+### Mental Model
+
+YASM answers three questions about every piece of state:
+
+| Question                    | Concept     | Example                                   |
+| :-------------------------- | :---------- | :---------------------------------------- |
+| _What kind_ of state is it? | **Section** | `UserRow` (shape + update logic)          |
+| _Which instance_ of it?     | **Path**    | `/tabs/1/users[7]`                        |
+| _Where_ does it live?       | **Routing** | Independently, or inside a parent section |
+
+A section is reusable logic; paths give you unlimited instances of it for free; routing optionally nests an instance inside another section's state instead of storing it on its own.
+
 ### Sections
 
-A section is `{ initialState, updater, routing?, normalize? }`. The updater is Immer-powered: mutate the draft **or** return a new state.
+A section is `{ initialState, updater, routing?, normalize?, persist? }`. The updater is Immer-powered: mutate the draft **or** return a new state.
 
 ```ts
 type Todo = { id: number; title: string };
@@ -94,6 +232,15 @@ const todoSection: Section<Todo[], { add: Todo }> = {
 
 Paths are plain strings, but by convention, they are hierarchical: `/tabs/12/users/table`. Segments are separated by `/`, `[`, or `.`. Purging and routing are **segment-aware**: `/tabs/1` covers `/tabs/1/x` and `/tabs/1[3]` but **not** `/tabs/10`.
 
+The boundary characters default to `'/'`, `'['`, and `'.'` (exported as `DEFAULT_PATH_BOUNDARY_CHARS`). If your paths follow a different convention, customize them when creating the store — purge matching and routing resolution both use the configured set:
+
+```ts
+const store = createStore(sectionMap, {
+    // extend the defaults, or replace them entirely (e.g. just ['/', '~'])
+    pathBoundaryChars: defaultChars => [...defaultChars, '~']
+});
+```
+
 ### Updaters & Payload Creators
 
 ```ts
@@ -102,6 +249,43 @@ const [state, update] = useYasmState('Counter', '/c');
 update({ count: 5 }); // Payload
 update(prev => ({ count: prev.count + 1 })); // Payload creator (reads latest state)
 ```
+
+YASM also ships updater factories and a setter helper. Both factories return the **same state reference** when nothing actually changes, so no-op updates produce no notifications:
+
+```ts
+const counterUpdater = mergeUpdaterGenerator<CounterState>(); // Partial<S> shallow merge
+const fieldUpdater = propertyUpdaterGenerator<CounterState>(); // { key, value } payload
+
+// Cached per-field setters with stable references (safe for dependency arrays):
+const setCount = getFieldSetter(update, 'count');
+setCount(5);
+setCount(prev => prev + 1);
+```
+
+The setter cache is keyed by the updater function — and YASM keeps the updater reference stable per `(section, path)` — so the same setter reference survives re-renders and remounts, and is safe to use in dependency arrays.
+
+> ⚠️ **Enable `exactOptionalPropertyTypes` — seriously!**
+>
+> Every partial-payload API in YASM (`mergeUpdaterGenerator` payloads, `overrideInitialState`, ArraySection `partialState`, and ObjectSection child payloads) is typed with **optional properties**. Under TypeScript's default behavior, an optional property also accepts an **explicit `undefined`** — so this compiles without any complaint:
+>
+> ```ts
+> // age is typed `number` — and we just silently made it undefined!
+> updateState({ age: undefined });
+> ```
+>
+> At runtime the merge overwrites `age` with `undefined`, breaking every invariant that expects a number. The fix is one compiler flag (which — surprisingly — is **not** part of `strict`):
+>
+> ```json
+> // tsconfig.json
+> {
+>     "compilerOptions": {
+>         "strict": true,
+>         "exactOptionalPropertyTypes": true
+>     }
+> }
+> ```
+>
+> With the flag enabled, the assignment above becomes a **compile-time error**, while fields that are *genuinely* nullable (`age?: number | undefined`) remain fully assignable. This is the single most important tsconfig flag for YASM users.
 
 ### Selectors & Overrides
 
@@ -119,6 +303,12 @@ const [state, update] = useYasmState('Counter', '/c', {
 ---
 
 ## 🧬 Composition & Routing
+
+Composition lets one section store its state **inside another section**. The parent owns the single copy of the data; child hooks address slices of it through **path routing**. One source of truth, two views: `useYasmState('UserTable', '/users')` sees the whole table, while `useYasmState('UserRow', '/users[7]')` reads and writes row 7 _inside_ that same table state — immutably, with the parent's subscribers notified.
+
+Both the parent and every child must be registered in `createStore`: the child section defines the shape and updater of its slice, and the composed parent defines how slices are addressed.
+
+> ⚠️ **Strict bracket syntax**: the built-in generators address children with `[id]` / `[key]` segments. `/users/7` is **not** the same as `/users[7]` — it matches the parent prefix but then fails routing with an "invalid ArraySection path" error when read. Only bracket segments select into composed sections.
 
 ### ArraySection
 
@@ -140,19 +330,126 @@ const [row, updateRow] = useYasmState('UserRow', '/users[7]');
 updateRow({ name: 'Sara A.' }); // Immutably updates the row inside the table
 ```
 
+The parent state is an ordered map: `{ order: number[]; map: Record<number, S> }` — `order` holds row ids in display order, `map` holds the row states keyed by id. So `table.map[7]` is exactly what `row` reads through the child hook.
+
+> ⚠️ **IDs are not array indexes**: `[7]` means the row with **id 7** (the key in `map`), not the seventh row. `order` alone controls display/iteration order; `map` is the lookup. With `order: [20, 5, 100]`, the second rendered row is `/users[5]` (`map[5]`) — even though it sits at index 1.
+
 The `updater` payload supports `order`, `addingItems`, `editingItems`, and `removingIDs`. These are applied in the order: **order → removals → additions → edits**, allowing you to add and edit the same item in a single update.
+
+- `addingItems` merges each `partialState` over the child section's `initialState`.
+- `editingItems` runs the child section's own updater on the row; an id missing from `map` is skipped with a development warning.
+- `removingIDs` deletes rows from `map` only — keeping `order` in sync is your responsibility. A stale id in `order` points at a removed row and throws a "has not been initialized" error when routed to.
 
 ### ObjectSection
 
 ```ts
+const profileState = { firstName: '', lastName: '' };
+const addressState = { city: '', street: '' };
+const profileUpdater = mergeUpdaterGenerator<typeof profileState>();
+const addressUpdater = mergeUpdaterGenerator<typeof addressState>();
+
+// The composed parent: each entry maps a local key to a registered child section
 const formSection = objectSectionGenerator({
     profile: { name: 'Profile', state: profileState, updater: profileUpdater },
     address: { name: 'Address', state: addressState, updater: addressUpdater }
 });
-// Child access: useYasmState('Profile', '/form[profile]')
+
+const store = createStore({
+    Form: formSection,
+    // ⚠️ Children must be registered too, under the same names used above —
+    // otherwise YASM logs 'there is no "X" section to have a route on!'
+    Profile: { initialState: profileState, updater: profileUpdater },
+    Address: { initialState: addressState, updater: addressUpdater }
+});
+
+// Parent: the whole form
+const [form, updateForm] = useYasmState('Form', '/form');
+updateForm({ profile: { firstName: 'Sara' } });
+
+// Child: one field group, addressed through the parent
+const [profile, updateProfile] = useYasmState('Profile', '/form[profile]');
+updateProfile({ lastName: 'A.' });
 ```
 
+ObjectSection is not an object-merge helper — it creates **routing boundaries**. Each child keeps owning its own state shape and updater; the parent only owns placement (where the child lives inside its state).
+
+### Deep / Nested Composition
+
+Routers compose recursively: a composed child can itself be a composed parent. A table of rows, where each row is a form:
+
+```ts
+const rowForm = objectSectionGenerator({
+    profile: { name: 'Profile', state: profileState, updater: profileUpdater },
+    settings: { name: 'Settings', state: settingsState, updater: settingsUpdater }
+});
+
+const store = createStore({
+    Table: arraySectionGenerator('Row', rowForm),
+    Row: rowForm, // the composed row doubles as ArraySection child and routing parent
+    Profile: { initialState: profileState, updater: profileUpdater },
+    Settings: { initialState: settingsState, updater: settingsUpdater }
+});
+
+useYasmState('Table', '/table');                // the whole table
+useYasmState('Row', '/table[5]');               // row 5 (the whole form)
+useYasmState('Profile', '/table[5][profile]');  // just the profile of row 5
+```
+
+The path query is evaluated level by level — `[5]` selects the row inside the table, then the remaining `[profile]` is handed to the row's own routing. Note that each intermediate level must be in use first (its path is registered when a hook at that path initializes), following the parent-first rule below.
+
+### How Routing Works
+
+- **Registration**: when a parent path (e.g. `/users`) is first used, YASM records it in an internal `pathRegistry`. A child hook like `useYasmState('UserRow', '/users[7]')` resolves its parent by segment-aware matching against registered paths, then applies the parent's router: `[7]` selects row 7 from the table state. Any remaining path continues through deeper registered routing, so **multi-level composition works** — a row can itself be a composed section with its own children.
+- **Initialize the parent first**: the registry entry is created when the parent path is initialized. If a child path is used before its parent path exists (fresh session, parent not yet mounted), routing cannot resolve and YASM falls back to storing that child's state directly. After hydration the registry is restored from persistence, so children route correctly even before the parent component mounts — this is exactly why YASM persists `pathRegistry`.
+- **Notifications**: a child update produces a new parent state immutably, so subscribers of the parent path are notified (the table view re-renders). Child hooks use their own selectors, which keeps their re-renders precise — a row only re-renders when its selected slice actually changed.
+- **Custom routers**: the `routing` field of a section accepts a `Router` (`selectByPathQuery` / `updateByPathQuery`) per child name, so you can build your own composition shapes. You rarely need to — the two generators cover the common cases.
+
 > ⚠️ **Warning**: Registered routing paths must not be nested within each other. YASM logs an error in development if a path is a segment-prefix of another registered path of a routing section.
+
+### Custom Routers
+
+If brackets don't fit your mental model — or you need a different data structure, like a plain dictionary — define the `routing` field yourself. A `Router` provides `selectByPathQuery` (resolve the child state from the remaining path) and `updateByPathQuery` (apply the child's new state immutably into the parent). Here is a dictionary router using dot-notation (`.key`) instead of brackets:
+
+```ts
+const dictionarySection: Section<
+    Record<string, ChildState>,
+    Record<string, Partial<ChildState>>
+> = {
+    initialState: {},
+    updater: (state, payload) => {
+        for (const key in payload) {
+            state[key] = { ...state[key], ...payload[key] };
+        }
+    },
+    routing: {
+        // The key must match the child's registered section name
+        Child: {
+            // pathQuery is the part after the registered parent path,
+            // e.g. '.user1' for useYasmState('Child', '/dict.user1')
+            selectByPathQuery: (state, pathQuery) => {
+                const key = pathQuery.slice(1); // strip the leading '.'
+                if (state[key] === undefined) {
+                    throw new Error(`YASM: unknown dictionary key "${key}".`);
+                }
+                return [state[key], '']; // child state + unused remainder
+            },
+            updateByPathQuery: (state, pathQuery, getChildState) => {
+                const key = pathQuery.slice(1);
+                const newChild = getChildState(state[key], '');
+
+                // 🔒 No-op bailout: an unchanged child keeps the parent reference
+                if (newChild === state[key]) {
+                    return state;
+                }
+
+                return { ...state, [key]: newChild };
+            }
+        }
+    }
+};
+```
+
+Since `.` is one of the default boundary characters, `/dict.user1` segment-matches the registered parent path `/dict` and routes through the custom router — the same mechanics the generators use, just a different query syntax.
 
 ---
 
@@ -175,6 +472,30 @@ purge('/tabs/12'); // Removes state, subscribers, memo records & path registrati
 ## 💾 Persistence
 
 Persistence is configured in the second argument to `createStore`. YASM saves `store.state`, `store.pathRegistry`, and a small `metadata` record (used for migration bookkeeping). The registry is required to restore composition/routing correctly.
+
+The full hydration pipeline, in execution order:
+
+```mermaid
+flowchart TD
+    A["storage.getItem(key)"] --> B{{"Raw data present?"}}
+    B -- "no (fresh install)" --> M["Mark all migrations as executed"]
+    B -- yes --> P
+    subgraph P["Read &amp; repair pipeline"]
+        C["JSON.parse + deserializer"] --> D["Managed migrations<br/>(per section & path)"]
+        D --> E["onBeforeHydrate hook"]
+        E --> F["Prune stale sections<br/>& registry entries"]
+        F --> G["Validate registry against state"]
+        G --> H["Normalization<br/>(transient rules, healing)"]
+        H --> I["Merge into store state"]
+    end
+    I --> J{{"State changed during hydration?"}}
+    J -- yes --> K["Repair-save to storage"]
+    J -- no --> L["onHydrated()"]
+    K --> L
+    M --> L
+    P -. "any step throws" .-> Q["Quarantine: back up raw data,<br/>overwrite the key with fresh state"]
+    Q --> L
+```
 
 The storage adapter may be synchronous or asynchronous and must provide the following shape:
 
@@ -245,7 +566,7 @@ export const StoreProvider = ({ children }: { children: ReactNode }) => {
 > ⚠️ **Race Condition Warning**
 > Call `store.hydrate()` **once** during application startup **and before mounting any component that calls `useYasmState`**.
 > If a component initializes a path before `hydrate()` finishes, the path is created with the current `initialState`. When the persisted data later arrives, it is shallow-merged, which can produce surprising results or overwrite user actions that happened in the meantime.
-> `hydrate()` always resolves (even on failure); on error, YASM logs the issue, keeps the stored snapshot intact, and leaves the fresh in-memory state in place.
+> `hydrate()` always resolves (even on failure). If the stored snapshot is corrupted, YASM backs it up to a quarantine key and starts fresh — see **Corrupted Snapshot Handling** below.
 
 ### LocalForage / IndexedDB Adapter
 
@@ -270,6 +591,22 @@ const store = createStore(sectionMap, {
     }
 });
 ```
+
+### Corrupted Snapshot Handling (Quarantine)
+
+If anything goes wrong while reading or repairing the stored snapshot — invalid JSON, a failing migration, a throwing `onBeforeHydrate` hook — YASM never crashes and never keeps broken data in the primary key. Instead it **quarantines** the corruption:
+
+1. If raw data could be read, it is backed up untouched to a new storage key: `<key>_corrupted_backup_<ISO-timestamp>` (e.g. `yasmState_corrupted_backup_2026-08-22T14-30-05-123Z`), so nothing is ever lost.
+2. The main `<key>` is overwritten with a clean, fresh state, removing the corrupted data from the primary key.
+3. The session continues unlocked — new updates, autosaves, and manual saves work normally from the fresh state.
+
+```ts
+// After a corrupted hydration you will find in storage:
+// 'yasmState'                      → clean fresh snapshot
+// 'yasmState_corrupted_backup_...' → the untouched corrupted raw data
+```
+
+⚠️ Quarantine backups accumulate over time. Prune old `<key>_corrupted_backup_*` entries yourself if your users hit repeated corruption.
 
 ### Manual Save & Autosave
 
@@ -306,6 +643,20 @@ omitSections: state =>
 ```
 
 Both the `state` and the `pathRegistry` entries of omitted sections are excluded, ensuring nothing from these sections ever reaches storage.
+
+**Alternatively, exclude a section at its definition** with `persist: false`. While `omitSections` is configured on the store (and can be dynamic), `persist` is declared on the section itself — a permanent, declarative opt-out that travels with the section definition:
+
+```ts
+const credentialSection: Section<CredentialState, CredentialPayload> = {
+    initialState: { token: '', refreshToken: '' },
+    updater: credentialUpdater,
+    persist: false // 🔒 never persisted — lives in memory for the session only
+};
+```
+
+- The section behaves completely normally in memory during the session; it simply never reaches storage and starts fresh from its `initialState` on every boot.
+- Both mechanisms combine: a section is excluded whenever it is listed in `omitSections` (statically or dynamically) **or** has `persist: false`.
+- `persist` is fixed at definition time — for state-dependent decisions (e.g. "persist credentials only if _remember me_ is checked"), use the function form of `omitSections` instead.
 
 ### Custom Serialization (`Date`, `BigInt`, `Decimal`, …)
 
@@ -352,9 +703,9 @@ If you use string prefixes (like `$$BIGINT$$_`) for custom serialization, you mu
 
 To prevent this silent data corruption, implement a **Universal String Escape Mechanism**. By unconditionally prefixing _all_ strings with a dedicated tag (e.g., `$$STR$$_`), you guarantee that any string input is safely restored as a string, regardless of its contents.
 
-#### Applying this to your App
+#### Complete Example
 
-You can optimize your own app's codebase by replacing previous naive `$$STR$$_` logic with this selective escaping:
+The following self-contained pair implements the universal string escape and follows the explicit-prefix advice from above — dates get their own `$$DATE$$_` tag instead of heuristic ISO-string guessing:
 
 ```ts
 function serializer(
@@ -368,6 +719,10 @@ function serializer(
 
     if (Decimal.isDecimal(object[key])) {
         return '$$DECIMAL$$_' + object[key].toJSON();
+    }
+
+    if (object[key] instanceof Date) {
+        return '$$DATE$$_' + object[key].toISOString();
     }
 
     // 🛡️ Escape mechanism for primitive strings:
@@ -396,12 +751,12 @@ function deserializer(key: string, value: unknown) {
         return new Decimal(value.slice('$$DECIMAL$$_'.length));
     }
 
-    if (value.startsWith('$$STR$$_')) {
-        return value.slice('$$STR$$_'.length);
+    if (value.startsWith('$$DATE$$_')) {
+        return new Date(value.slice('$$DATE$$_'.length));
     }
 
-    if (isISODateString(value)) {
-        return new Date(value);
+    if (value.startsWith('$$STR$$_')) {
+        return value.slice('$$STR$$_'.length);
     }
 
     return value;
@@ -582,12 +937,44 @@ const useValueState = <T>(path: string, initial: T) => {
 
 - 🏷️ **Name paths after your UI hierarchy** (`/tabs/{id}/...`) so a single purge call cleans a whole tab.
 - 🧯 **Don’t purge paths that are still rendered.**
-- 🔁 **Don’t subscribe to state you only write.** Use a constant selector (`() => null`) to obtain just the updater.
+- 🔁 **Don’t subscribe to state you only write.** Use `useYasmStateUpdater` — or, with raw `useYasmState`, the constant selector `() => null` (see **Write-Only Access** under 💎 TypeScript: Strongly Typed Hooks).
 - 💾 **Use normalization for ordinary schema changes**; use `migrations` for real application structural changes.
-- 🐞 **Debugging options** live under `debugOptions`:
-    - `logStateUpdates: true`
+- 🐞 **Debugging options** live under `debugOptions` (all dev-only — never active in production):
+    - `logStateUpdates: true` — log every state update and purge.
+    - `logStateUpdates: event => boolean` — **filter callback**: decide per event whether it should be logged. Highly recommended for busy apps where full logging is too noisy.
     - `snapshotScope: 'local' | 'full'` (default `'local'`)
     - `purgeSnapshotScope: 'none' | 'full'` (default `'none'`)
+
+    The callback receives a `LogEvent` describing what is about to be logged:
+
+    ```ts
+    type LogEvent =
+        | {
+              type: 'update';
+              sectionName: string;
+              path: string;
+              payload: unknown;
+          }
+        | { type: 'purge'; pathPrefix: string };
+    ```
+
+    For example, log only updates of one section and purges under one tab:
+
+    ```ts
+    const store = createStore(sectionMap, {
+        debugOptions: {
+            logStateUpdates: event =>
+                event.type === 'purge'
+                    ? event.pathPrefix.startsWith('/tabs')
+                    : event.sectionName === 'TransactionTable'
+        }
+    });
+    ```
+
+    When the callback form is used, matching entries are tagged `YASM (Filtered)` in the console (with a colored badge) so you can tell them apart from the plain full-logging output.
+
+- 🧊 **Direct mutations throw in development**: when a path is first initialized, YASM deep-freezes its state (development only, `NODE_ENV !== 'production'`). Mutating state outside of updaters fails fast with a `TypeError` instead of silently corrupting the store; the check is skipped in production builds for performance.
+- ⚠️ **Enable `exactOptionalPropertyTypes` in your tsconfig** — otherwise `updateState({ age: undefined })` compiles even when `age: number` and silently corrupts your state. See the warning under **Updaters & Payload Creators**.
 - 🚫 **A payload that is a function is always treated as a payload creator**—never store bare functions as payloads.
 
 ---
@@ -621,6 +1008,7 @@ const useValueState = <T>(path: string, initial: T) => {
 | `store.save()`                                    | method   | Immediately saves through built-in and/or custom persistence.                                                              |
 | `YasmContext`                                     | context  | Provide the store to your tree.                                                                                            |
 | `useYasmState(name, path, selectorOrOptions?)`    | hook     | Returns `[state, updater]`. Options: `selector`, `overrideInitialState`.                                                   |
+| `useYasmStateUpdater(name, path)`                 | hook     | Write-only access: returns just the updater; never subscribes or re-renders.                                               |
 | `usePurgeYasmState()`                             | hook     | Returns `purge(pathPrefix, options?)`.                                                                                     |
 | `purgeYasmState(store, pathPrefix, options?)`     | function | Pure purge — usable outside React.                                                                                         |
 | `arraySectionGenerator(childName, childSection)`  | function | Ordered map of child states with routing.                                                                                  |
@@ -629,6 +1017,7 @@ const useValueState = <T>(path: string, initial: T) => {
 | `propertyUpdaterGenerator<S>()`                   | function | `{ key, value }` updater.                                                                                                  |
 | `getFieldSetter(updateState, field)`              | function | Cached per-field setter factory.                                                                                           |
 | `isPathWithinPrefix(path, prefix, boundaryChars)` | function | Segment-aware prefix check.                                                                                                |
+| `DEFAULT_PATH_BOUNDARY_CHARS`                     | constant | The default segment boundaries (`'/'`, `'['`, `'.'`); customize via the `pathBoundaryChars` store option.                  |
 
 ---
 
@@ -644,7 +1033,3 @@ npm run typecheck   # tsc -p tsconfig.test.json
 ## 📄 License
 
 MIT © MRNafisiA
-
-```
-
-```

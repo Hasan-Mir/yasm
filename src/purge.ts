@@ -38,13 +38,26 @@ const purgeYasmState = <SM extends Record<Name, Section>>(
             ? path.startsWith(pathPrefix)
             : isPathWithinPrefix(path, pathPrefix, store.pathBoundaryChars);
 
-    const shouldLog =
+    let shouldLog = false;
+    if (
         process.env.NODE_ENV !== 'production' &&
-        store.debugOptions.logStateUpdates === true;
+        store.debugOptions.logStateUpdates
+    ) {
+        if (typeof store.debugOptions.logStateUpdates === 'function') {
+            shouldLog = store.debugOptions.logStateUpdates({
+                type: 'purge',
+                pathPrefix: pathPrefix
+            });
+        } else {
+            shouldLog = store.debugOptions.logStateUpdates === true;
+        }
+    }
 
     let isStateChanged = false;
     const purgeScope = store.debugOptions.purgeSnapshotScope || 'none';
     const purgedPaths = shouldLog ? new Set<string>() : null;
+    const isFilteredLog =
+        typeof store.debugOptions.logStateUpdates === 'function';
 
     if (shouldLog) {
         const matchTypeStr =
@@ -52,7 +65,17 @@ const purgeYasmState = <SM extends Record<Name, Section>>(
                 ? 'starting with'
                 : 'matching segment';
 
-        console.debug(`purging paths ${matchTypeStr} "${pathPrefix}"`);
+        if (isFilteredLog) {
+            console.debug(
+                `%cYASM (Filtered)%c purging paths ${matchTypeStr} "${pathPrefix}"`,
+                'background: #0d9488; color: white; padding: 2px 6px; border-radius: 4px; font-weight: bold;',
+                'color: inherit;'
+            );
+        } else {
+            console.debug(
+                `YASM: purging paths ${matchTypeStr} "${pathPrefix}"`
+            );
+        }
 
         if (purgeScope === 'full') {
             console.debug('before purge:');

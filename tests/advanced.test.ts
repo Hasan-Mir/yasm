@@ -4,7 +4,13 @@ import React from 'react';
 import { renderToString } from 'react-dom/server';
 import { YasmContext } from '../src/Context';
 import { createStore, Section } from '../src/createStore';
-import { init, route, useYasmState } from '../src/useYasmState';
+import {
+    init,
+    route,
+    useYasmState,
+    useYasmStateUpdater
+} from '../src/useYasmState';
+import { usePurgeYasmState } from '../src/usePurgeYasmState';
 import { purgeYasmState } from '../src/purge';
 import {
     arraySectionGenerator,
@@ -338,6 +344,40 @@ test('React hooks require a provider and render selected state with a provider',
     assert.match(html, />0</);
 });
 
+test('useYasmStateUpdater returns a working updater without subscribing', () => {
+    const store = createStore({ State: section });
+    let capturedUpdater: ((payload: Partial<State>) => void) | undefined;
+
+    const UpdaterOnly = () => {
+        capturedUpdater = useYasmStateUpdater<
+            typeof store.sectionMap,
+            'State'
+        >('State', '/wo');
+        return null;
+    };
+
+    renderToString(
+        React.createElement(
+            YasmContext.Provider,
+            { value: store as never },
+            React.createElement(UpdaterOnly)
+        )
+    );
+
+    // The write-only hook still lazily initializes the state...
+    assert.deepEqual(store.state.State['/wo'], { value: 0, text: '' });
+
+    // ...but never subscribes the component
+    assert.equal(store.subscribers.State['/wo'], undefined);
+
+    // The returned updater dispatches standalone
+    capturedUpdater!({ value: 42 });
+    assert.equal(store.state.State['/wo'].value, 42);
+
+    // Regular consumers share the same memoized updater record
+    assert.equal(init(store, 'State', '/wo').updater, capturedUpdater);
+});
+
 test('array section normalizer rejects malformed persisted maps safely', async () => {
     const storage = createStorage(
         JSON.stringify({
@@ -404,4 +444,121 @@ test('object updates remain immutable when composed through Immer', () => {
     assert.equal(before.child.value, 1);
     assert.equal(after.child.value, 2);
     assert.notEqual(after, before);
+});
+
+test('React hooks: useYasmState accepts the options object overload', () => {
+    const store = createStore({ State: section });
+    let renderedValue: number | undefined;
+
+    const Consumer = () => {
+        const [value] = useYasmState('State', '/opt', {
+            selector: s => s.value,
+            overrideInitialState: { value: 99 }
+        });
+        renderedValue = value;
+        return null;
+    };
+
+    renderToString(
+        React.createElement(
+            YasmContext.Provider,
+            { value: store as never },
+            React.createElement(Consumer)
+        )
+    );
+
+    assert.equal(renderedValue, 99);
+    assert.equal(store.state.State['/opt'].value, 99);
+});
+
+test('React hooks: usePurgeYasmState returns a context-bound purge function', () => {
+    const store = createStore({ State: section });
+    init(store, 'State', '/p');
+
+    let capturedPurge: ((path: string) => void) | undefined;
+
+    const PurgeComponent = () => {
+        capturedPurge = usePurgeYasmState();
+        return null;
+    };
+
+    renderToString(
+        React.createElement(
+            YasmContext.Provider,
+            { value: store as never },
+            React.createElement(PurgeComponent)
+        )
+    );
+
+    assert.notEqual(store.state.State['/p'], undefined);
+
+    // Execute the hook-provided purge like an event handler would
+    capturedPurge!('/p');
+
+    assert.equal(store.state.State['/p'], undefined);
+});
+
+test('store.save() without persistence configuration is a safe no-op', async () => {
+    const store = createStore({ State: section });
+    await assert.doesNotReject(store.save());
+});
+
+test('createStore accepts an empty section map', () => {
+    const store = createStore({});
+    assert.deepEqual(store.state, {});
+
+    assert.throws(
+        () => init(store, 'Ghost' as never, '/x'),
+        /unknown section "Ghost"/
+    );
+});
+
+test('all subscribers of a path are notified and the updater keeps its identity', () => {
+    const store = createStore({ State: section });
+    init(store, 'State', '/a');
+    const record = store.memo.State['/a'];
+
+    let first = 0;
+    let second = 0;
+    record.subscribe(() => first++);
+    record.subscribe(() => second++);
+
+    record.updater({ value: 1 });
+    assert.equal(first, 1);
+    assert.equal(second, 1);
+
+    // Re-init returns the same memoized plumbing (stable updater reference)
+    assert.equal(init(store, 'State', '/a').updater, record.updater);
+});
+
+test('logStateUpdates filter callback narrows logging to matching events', async () => {
+    const store = createStore(
+        { State: section, Other: section },
+        {
+            debugOptions: {
+                logStateUpdates: event =>
+                    event.type === 'update' && event.sectionName === 'State'
+            }
+        }
+    );
+
+    const messages = await captureDebug(() => {
+        init(store, 'State', '/a');
+        init(store, 'Other', '/o');
+        store.memo.State['/a'].updater({ value: 1 });
+        store.memo.Other['/o'].updater({ value: 2 });
+        purgeYasmState(store, '/a');
+    });
+
+    // Only the matching update is logged, tagged as filtered
+    assert.ok(
+        messages.some(
+            args =>
+                String(args[0]).includes('YASM (Filtered)') &&
+                String(args[0]).includes('updating "State"')
+        )
+    );
+    // Non-matching section updates and the purge event are filtered out
+    assert.ok(!messages.some(args => String(args[0]).includes('"Other"')));
+    assert.ok(!messages.some(args => String(args[0]).includes('purging')));
 });

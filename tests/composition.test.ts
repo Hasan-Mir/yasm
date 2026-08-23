@@ -193,3 +193,172 @@ test('ObjectSection composes named sections', () => {
     assert.equal(next.counter.count, 2);
     assert.equal(next.flag.on, false);
 });
+
+test('multi-level composition routes through nested parents', () => {
+    const profileSection: Section<{ name: string }, { name?: string }> = {
+        initialState: { name: '' },
+        updater: mergeUpdaterGenerator<{ name: string }>()
+    };
+    const settingsSection: Section<
+        { compact: boolean },
+        { compact?: boolean }
+    > = {
+        initialState: { compact: false },
+        updater: mergeUpdaterGenerator<{ compact: boolean }>()
+    };
+    const rowForm = objectSectionGenerator({
+        profile: {
+            name: 'Profile',
+            state: profileSection.initialState,
+            updater: profileSection.updater
+        },
+        settings: {
+            name: 'Settings',
+            state: settingsSection.initialState,
+            updater: settingsSection.updater
+        }
+    });
+    const store = createStore({
+        Table: arraySectionGenerator('Row', rowForm),
+        Row: rowForm,
+        Profile: profileSection,
+        Settings: settingsSection
+    });
+
+    init(store, 'Table', '/table');
+    store.memo.Table['/table'].updater({
+        addingItems: [{ id: 5, partialState: { profile: { name: 'Sara' } } }],
+        order: [5]
+    });
+
+    // Register the intermediate row path, then route two levels deep
+    init(store, 'Row', '/table[5]');
+    // Regression lock: the routed intermediate parent MUST register its
+    // path — this is exactly what used to break multi-level composition.
+    assert.deepEqual(store.pathRegistry.Row, ['/table[5]']);
+    init(store, 'Profile', '/table[5][profile]');
+
+    const profile = store.memo.Profile['/table[5][profile]'];
+    assert.equal(profile.getState().name, 'Sara');
+
+    profile.updater({ name: 'Updated' });
+    assert.equal(store.state.Table['/table'].map[5].profile.name, 'Updated');
+
+    // The routed leaf never creates its own storage
+    assert.equal(store.state.Profile['/table[5][profile]'], undefined);
+});
+
+test('a child used before its parent falls back to direct storage', () => {
+    const store = makeStore();
+
+    // No Table hook at '/t' yet: routing cannot resolve a registered parent,
+    // so the child state is stored directly instead of inside the parent.
+    init(store, 'Row', '/t[3]');
+    assert.notEqual(store.state.Row['/t[3]'], undefined);
+
+    // Once the parent path is registered, new child hooks route through it
+    init(store, 'Table', '/t');
+    init(store, 'Row', '/t[9]');
+    assert.equal(store.state.Row['/t[9]'], undefined);
+});
+
+test('ArraySection: removing and editing the same id in one payload skips the edit', async () => {
+    const store = makeStore();
+    init(store, 'Table', '/t');
+    store.memo.Table['/t'].updater({ addingItems: [{ id: 4 }], order: [4] });
+
+    // Removals run before edits, so the edit targets an already-removed row
+    const warnings = await captureWarnings(() =>
+        store.memo.Table['/t'].updater({
+            removingIDs: [4],
+            editingItems: [{ id: 4, itemPayload: { title: 'zombie' } }]
+        })
+    );
+
+    assert.equal(store.state.Table['/t'].map[4], undefined);
+    assert.equal(warnings.length, 1, 'the skipped edit must warn in dev');
+});
+
+test('two ArraySection instances at different paths are fully isolated', () => {
+    const store = makeStore();
+    init(store, 'Table', '/tabs/1/users');
+    init(store, 'Table', '/tabs/2/users');
+
+    store.memo.Table['/tabs/1/users'].updater({
+        addingItems: [{ id: 1, partialState: { title: 't1' } }],
+        order: [1]
+    });
+    store.memo.Table['/tabs/2/users'].updater({
+        addingItems: [{ id: 1, partialState: { title: 't2' } }],
+        order: [1]
+    });
+
+    assert.equal(store.state.Table['/tabs/1/users'].map[1].title, 't1');
+    assert.equal(store.state.Table['/tabs/2/users'].map[1].title, 't2');
+});
+
+test('custom routers compose sections with their own path syntax', () => {
+    type Entry = { label: string };
+    const entrySection: Section<Entry, Partial<Entry>> = {
+        initialState: { label: '' },
+        updater: mergeUpdaterGenerator<Entry>()
+    };
+    const dictionarySection: Section<
+        Record<string, Entry>,
+        Record<string, Partial<Entry>>
+    > = {
+        initialState: {},
+        updater: (state, payload) => {
+            for (const key in payload) {
+                state[key] = { ...state[key], ...payload[key] };
+            }
+        },
+        routing: {
+            Entry: {
+                // pathQuery is the part after the registered parent path,
+                // e.g. '.user1' for init(store, 'Entry', '/dict.user1')
+                selectByPathQuery: (state, pathQuery) => {
+                    const key = pathQuery.slice(1); // strip the leading '.'
+                    if (state[key] === undefined) {
+                        throw new Error(
+                            `YASM: unknown dictionary key "${key}".`
+                        );
+                    }
+                    return [state[key], ''];
+                },
+                updateByPathQuery: (state, pathQuery, getEntryState) => {
+                    const key = pathQuery.slice(1);
+                    const newEntry = getEntryState(state[key], '');
+
+                    // No-op bailout: an unchanged child keeps the parent ref
+                    if (newEntry === state[key]) {
+                        return state;
+                    }
+
+                    return { ...state, [key]: newEntry };
+                }
+            }
+        }
+    };
+
+    const store = createStore({ Dict: dictionarySection, Entry: entrySection });
+    init(store, 'Dict', '/dict');
+    store.memo.Dict['/dict'].updater({ user1: { label: 'first' } });
+
+    // '.' is a default boundary char, so '/dict.user1' routes through the
+    // custom router instead of bracket syntax.
+    init(store, 'Entry', '/dict.user1');
+    const entry = store.memo.Entry['/dict.user1'];
+    assert.equal(entry.getState().label, 'first');
+    assert.equal(store.state.Entry['/dict.user1'], undefined);
+
+    const before = store.state.Dict['/dict'];
+    entry.updater({ label: 'updated' });
+    assert.equal(store.state.Dict['/dict'].user1.label, 'updated');
+    assert.notEqual(store.state.Dict['/dict'], before);
+
+    // A no-op child update preserves the parent reference entirely
+    const refBeforeNoop = store.state.Dict['/dict'];
+    entry.updater({ label: 'updated' });
+    assert.equal(store.state.Dict['/dict'], refBeforeNoop);
+});

@@ -4,7 +4,7 @@
         "lib": ["ES2021", "DOM"],
         "module": "ESNext",
         "moduleResolution": "Bundler",
-        "declaration": true, 
+        "declaration": true,
         "declarationMap": true,
         "sourceMap": true,
         "rootDir": "./src",
@@ -17,7 +17,8 @@
         "noUnusedLocals": true,
         "noUnusedParameters": true,
         "noImplicitReturns": true,
-        "noFallthroughCasesInSwitch": true
+        "noFallthroughCasesInSwitch": true,
+        "exactOptionalPropertyTypes": true
     },
     "include": ["src"],
     "exclude": ["node_modules", "dist", "tests", "examples"]

@@ -10,6 +10,13 @@ import {
     SYMBOL_NOTIFY_CHANGE
 } from './createStore';
 
+/**
+ * Overrides applied on top of `initialState` when a path is initialized:
+ * either an object merged over the initial state, or a callback receiving
+ * the initial state and returning a partial override. Applied only on the
+ * *first* initialization of that path — later mounts reuse the memoized
+ * record and ignore it.
+ */
 type OverrideInitialState<
     SM extends Record<Name, Section>,
     N extends keyof SM
@@ -17,6 +24,22 @@ type OverrideInitialState<
     | Partial<SM[N]['initialState']>
     | ((initialState: SM[N]['initialState']) => Partial<SM[N]['initialState']>);
 
+/**
+ * Subscribes to the state of section `name` at `path` and returns
+ * `[stateOrSelection, updater]`.
+ *
+ * The state instance is created lazily on first use from the section's
+ * `initialState` (optionally amended by `overrideInitialState`). The
+ * updater accepts a payload or a payload creator and dispatches through
+ * the section's updater with Immer; a no-op update (unchanged reference)
+ * skips notifications entirely. Routed paths (e.g. `/users[7]`) read and
+ * write inside their parent section's state.
+ *
+ * ⚠️ Selectors must return stable values for unchanged state — a selector
+ * that builds a new object/array on every call re-renders forever under
+ * `useSyncExternalStore`. For write-only access use
+ * `useYasmStateUpdater(name, path)` instead.
+ */
 // Overload 1: Basic use (no selector) or use with a selector
 function useYasmState<SM extends Record<Name, Section>, N extends keyof SM, S>(
     name: N,
@@ -33,6 +56,20 @@ function useYasmState<SM extends Record<Name, Section>, N extends keyof SM, S>(
     path: Path,
     options: {
         selector?: (state: SM[N]['initialState']) => S;
+        /**
+         * Overrides applied on top of `initialState` when the path is
+         * initialized (object or callback form; first init only).
+         *
+         * ⚠️ IMPORTANT — enable `exactOptionalPropertyTypes` in your
+         * tsconfig! The object form is a partial override, and under
+         * TypeScript's default settings optional properties also accept
+         * an *explicit* `undefined`. That means
+         * `overrideInitialState: { age: undefined }` compiles even when
+         * `age: number`, silently initializing the state with `undefined`.
+         * With the flag enabled it becomes a compile-time error, while
+         * genuinely nullable fields (`age: number | undefined`) remain
+         * assignable.
+         */
         overrideInitialState?: OverrideInitialState<SM, N>;
     }
 ): [
@@ -88,6 +125,31 @@ function useYasmState<SM extends Record<Name, Section>, N extends keyof SM, S>(
     );
 
     return [selectedState, updater];
+}
+
+/**
+ * A specialized hook that returns only the updater function for the state
+ * at `(name, path)` without subscribing the calling component to it.
+ *
+ * Unlike `useYasmState(name, path, () => null)` — which stays subscribed and
+ * merely bails out of re-rendering — this creates no subscription at all:
+ * the store's notification loop never touches the component, so it never
+ * re-renders. Ideal for components that only dispatch (buttons, submit
+ * handlers, background savers).
+ */
+function useYasmStateUpdater<
+    SM extends Record<Name, Section>,
+    N extends keyof SM
+>(name: N, path: Path): (payload: PayloadAndPayloadCreator<SM, N>) => void {
+    const store = useContext(YasmContext) as Store<SM> | undefined;
+
+    if (store === undefined) {
+        throw new Error(
+            'YASM: no store was found in the React context. Wrap your component tree in <YasmContext.Provider value={store}>.'
+        );
+    }
+
+    return init(store, name, path).updater;
 }
 
 /**
@@ -163,13 +225,16 @@ const init = <SM extends Record<Name, Section>, N extends keyof SM>(
 
             state[routedName][routedPath] = finalInitialState;
         }
+    }
 
-        if (
-            store.sectionMap[name].routing !== undefined &&
-            store.pathRegistry[name as Name].indexOf(path) === -1
-        ) {
-            store.pathRegistry[name as Name].push(path);
-        }
+    // Register every routing section instance, including sections routed
+    // through another routing parent. The registry is required for resolving
+    // deeper multi-level composition chains (e.g. Table → Row → Profile).
+    if (
+        store.sectionMap[name].routing !== undefined &&
+        store.pathRegistry[name as Name].indexOf(path) === -1
+    ) {
+        store.pathRegistry[name as Name].push(path);
     }
 
     const getState = () => routedGetState();
@@ -205,17 +270,42 @@ const init = <SM extends Record<Name, Section>, N extends keyof SM>(
             return;
         }
 
-        const shouldLog =
+        let shouldLog = false;
+        if (
             process.env.NODE_ENV !== 'production' &&
-            store.debugOptions.logStateUpdates === true;
+            store.debugOptions.logStateUpdates
+        ) {
+            if (typeof store.debugOptions.logStateUpdates === 'function') {
+                shouldLog = store.debugOptions.logStateUpdates({
+                    type: 'update',
+                    sectionName: routedName as keyof SM,
+                    path: routedPath,
+                    payload: resolvedPayload
+                });
+            } else {
+                shouldLog = store.debugOptions.logStateUpdates === true;
+            }
+        }
 
         const snapshotScope = store.debugOptions?.snapshotScope || 'local';
+        const isFilteredLog =
+            typeof store.debugOptions.logStateUpdates === 'function';
 
         if (shouldLog) {
-            console.debug(
-                `YASM: updating "${routedName}" at path "${routedPath}"`,
-                resolvedPayload
-            );
+            if (isFilteredLog) {
+                console.debug(
+                    `%cYASM (Filtered)%c updating "${String(routedName)}" at path "${routedPath}"`,
+                    'background: #0d9488; color: white; padding: 2px 6px; border-radius: 4px; font-weight: bold;',
+                    'color: inherit;',
+                    resolvedPayload
+                );
+            } else {
+                console.debug(
+                    `YASM: updating "${String(routedName)}" at path "${routedPath}"`,
+                    resolvedPayload
+                );
+            }
+
             console.debug('before:');
 
             snapshot(
@@ -408,5 +498,5 @@ const getExtraRoutes = <SM extends Record<Name, Section>>(
     return parentChain === undefined ? [parent] : [...parentChain, parent];
 };
 
-export { useYasmState, init, route, getExtraRoutes };
+export { useYasmState, useYasmStateUpdater, init, route, getExtraRoutes };
 export type { OverrideInitialState };

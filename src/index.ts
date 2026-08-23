@@ -1,5 +1,5 @@
 export { YasmContext } from './Context';
-export { useYasmState } from './useYasmState';
+export { useYasmState, useYasmStateUpdater } from './useYasmState';
 export { usePurgeYasmState } from './usePurgeYasmState';
 export { purgeYasmState, type PurgeOptions } from './purge';
 export {

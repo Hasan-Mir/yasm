@@ -15,6 +15,7 @@ The package entry point (`src/index.ts`) exposes the following runtime values:
 | `DEFAULT_PATH_BOUNDARY_CHARS`                     | `['/', '[', '.']`; used by segment-aware routing and purge matching.                                                                                                                                      |
 | `YasmContext`                                     | React context whose provider value is a store.                                                                                                                                                            |
 | `useYasmState(name, path, selectorOrOptions?)`    | Returns `[stateOrSelection, updater]`. The third argument is either a selector or `{ selector?, overrideInitialState? }`. The override is an object or callback and applies only on first initialization. |
+| `useYasmStateUpdater(name, path)`                 | Returns only the updater for `(name, path)` without subscribing the component — the store never notifies it, so it never re-renders.                                                                      |
 | `usePurgeYasmState()`                             | Returns `(pathPrefix, options?) => void`.                                                                                                                                                                 |
 | `purgeYasmState(store, pathPrefix, options?)`     | Removes matching state, subscribers, memo records, and routing registrations. `PurgeOptions.match` is `'segment'` (default) or `'startsWith'`.                                                            |
 | `arraySectionGenerator(childName, childSection)`  | Creates `{ order, map }` state with `order`, `addingItems`, `editingItems`, and `removingIDs` updater operations and child routing via `[id]`.                                                            |
@@ -76,11 +77,12 @@ Updates resolve payload creators at dispatch time, use Immer for immutable
 replacement, notify `onStateChange`/persistence, and then invoke subscribers.
 Purge notifies only when actual state or registry data was removed. Hydration
 filters obsolete sections and paths, runs migrations before `onBeforeHydrate`,
-normalizes before merging, and writes a repaired snapshot when necessary — but
-aborts that repair write when any part of hydration fails, so stored data is
-never overwritten by fresh state. Hook and queue failures (`onStateChange`,
-`onHydrated`, `onBeforeSave`, storage adapters) are caught, logged, and never
-reject `hydrate()`/`save()`.
+normalizes before merging, and writes a repaired snapshot when necessary. When
+any part of hydration fails, the corrupted raw data is quarantined: it is
+backed up under `<key>_corrupted_backup_<timestamp>` and the primary key is
+overwritten with a clean fresh snapshot. Hook and queue failures
+(`onStateChange`, `onHydrated`, `onBeforeSave`, storage adapters) are caught,
+logged, and never reject `hydrate()`/`save()`.
 
 ## 2. Scenario mapping
 
@@ -99,6 +101,28 @@ reject `hydrate()`/`save()`.
 
 - Array parent add/edit/remove/order followed by routed child read/update and
   parent subscription notification.
+- The write-only updater hook lazily initializes its path, shares the
+  memoized record with regular consumers, dispatches standalone, and creates
+  no subscriber entries.
+- Multi-level composition routes through nested parents (array → object);
+  a child used before its parent falls back to direct storage; hydration
+  restores routing through the persisted registry so children work before
+  the parent component mounts. Custom routers with their own path syntax
+  (dot-notation dictionaries) are covered end-to-end, including no-op
+  bailouts; remove+edit of the same id skips the edit; two ArraySection
+  instances at different paths stay isolated.
+- React hooks: the `useYasmState` options-object overload
+  (`selector` + `overrideInitialState`) and the context-bound
+  `usePurgeYasmState` execute through `renderToString`; all subscribers of
+  a path are notified; the memoized updater keeps its identity.
+- Persistence lifecycle phases execute in the documented order
+  (getItem → deserialize → migrations → onBeforeHydrate → repair-save →
+  onHydrated); purged state does not resurrect after save + rehydration;
+  BigInt/Date values round-trip through custom serializers; fields missing
+  from the stored snapshot are filled from `initialState`; the
+  `logStateUpdates` filter callback narrows logging to matching events;
+  `store.save()` without persistence config is a safe no-op; an empty
+  section map is accepted.
 - Object composition child update through a parent, including nested path errors.
 - Purging a parent path removes its routed registry and makes stale child
   updaters safe no-ops.
@@ -134,9 +158,9 @@ reject `hydrate()`/`save()`.
   save during hydration waits; updates after purge do not throw.
 - `save()` serializes the call-time snapshot even while the queue is backed
   up by slow storage writes.
-- A failing migration or a corrupt snapshot during hydration never triggers
-  the repair write; stored data stays byte-identical and the app boots with
-  fresh state.
+- A failing migration or a corrupt snapshot during hydration triggers the
+  quarantine flow: a `<key>_corrupted_backup_<timestamp>` entry is created,
+  the primary key is overwritten with fresh state, and the app boots normally.
 - Throwing `onStateChange`/`onHydrated`/`onBeforeSave` hooks are logged and
   isolated; `hydrate()`/`save()` still resolve.
 - Fresh installs mark migrations executed without running them; registry

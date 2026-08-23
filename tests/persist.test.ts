@@ -1192,3 +1192,235 @@ test('persistence: autosave uses requestIdleCallback when the browser exposes it
         }
     }
 });
+
+test('persistence: hydration restores routing so children work before the parent mounts', async () => {
+    const storage = createMockStorage();
+    await storage.setItem(
+        'test-key',
+        JSON.stringify({
+            state: {
+                Table: {
+                    '/t': {
+                        order: [3],
+                        map: {
+                            3: { count: 1, text: 'persisted', isLoading: false }
+                        }
+                    }
+                }
+            },
+            pathRegistry: { Table: ['/t'] }
+        })
+    );
+
+    const store = createStore(
+        { Dummy: dummySection, Table: tableSection, Row: dummySection },
+        { persist: { key: 'test-key', storage } }
+    );
+    await store.hydrate();
+
+    // The parent component never mounted — routing works through the
+    // restored registry instead of a live registration.
+    init(store, 'Row', '/t[3]');
+    const row = store.memo.Row['/t[3]'];
+    assert.equal(row.getState().text, 'persisted');
+
+    row.updater({ text: 'after hydration' });
+    assert.equal(store.state.Table['/t'].map[3].text, 'after hydration');
+    assert.equal(store.state.Row['/t[3]'], undefined);
+});
+
+test('persistence: lifecycle phases execute in the documented order', async () => {
+    const storage = createMockStorage();
+    await storage.setItem(
+        'test-key',
+        JSON.stringify({
+            state: {
+                Dummy: { '/a': { count: 1, text: '', isLoading: false } }
+            },
+            pathRegistry: {}
+        })
+    );
+
+    const phases: string[] = [];
+    const seen = new Set<string>();
+    const mark = (label: string) => {
+        if (!seen.has(label)) {
+            seen.add(label);
+            phases.push(label);
+        }
+    };
+
+    const store = createStore(
+        { Dummy: dummySection },
+        {
+            deserializer: (_key, value) => {
+                mark('deserialize');
+                return value;
+            },
+            serializer: (_object, _key, value) => {
+                mark('serialize');
+                return value;
+            },
+            persist: {
+                key: 'test-key',
+                storage: {
+                    getItem: async key => {
+                        mark('getItem');
+                        return storage.getItem(key);
+                    },
+                    setItem: async (key, value) => {
+                        mark('setItem');
+                        await storage.setItem(key, value);
+                    },
+                    removeItem: async key => {
+                        await storage.removeItem(key);
+                    }
+                },
+                migrations: {
+                    Dummy: [
+                        {
+                            id: 'm1',
+                            migrate: () => {
+                                mark('migration');
+                            }
+                        }
+                    ]
+                },
+                onBeforeHydrate: () => {
+                    mark('onBeforeHydrate');
+                },
+                onHydrated: () => {
+                    mark('onHydrated');
+                },
+                onBeforeSave: () => {
+                    mark('onBeforeSave');
+                }
+            }
+        }
+    );
+
+    await store.hydrate();
+
+    // The migration sets the changed-flag, so the repair-save (onBeforeSave
+    // → serialize → setItem) runs after the merge and before onHydrated.
+    assert.deepEqual(phases, [
+        'getItem',
+        'deserialize',
+        'migration',
+        'onBeforeHydrate',
+        'onBeforeSave',
+        'serialize',
+        'setItem',
+        'onHydrated'
+    ]);
+});
+
+test('persistence: purged state does not resurrect after save and rehydration', async () => {
+    const storage = createMockStorage();
+    const createTestStore = () =>
+        createStore(
+            { Dummy: dummySection },
+            { persist: { key: 'test-key', storage } }
+        );
+
+    const store1 = createTestStore();
+    await store1.hydrate();
+    init(store1, 'Dummy', '/keep');
+    init(store1, 'Dummy', '/gone');
+    store1.memo.Dummy['/keep'].updater({ count: 1 });
+    store1.memo.Dummy['/gone'].updater({ count: 2 });
+    purgeYasmState(store1, '/gone');
+    await store1.save();
+
+    const store2 = createTestStore();
+    await store2.hydrate();
+
+    assert.equal(store2.state.Dummy['/gone'], undefined);
+    assert.equal(store2.state.Dummy['/keep']?.count, 1);
+});
+
+test('persistence: custom serializer round-trips BigInt and Date values', async () => {
+    const storage = createMockStorage();
+    const BIGINT_PREFIX = '$$BIGINT$$_';
+    const DATE_PREFIX = '$$DATE$$_';
+
+    type WalletState = { balance: bigint; createdAt: Date };
+    const walletSection: Section<WalletState, Partial<WalletState>> = {
+        // BigInt() instead of literals: the test tsconfig targets ES5
+        initialState: { balance: BigInt(0), createdAt: new Date(0) },
+        updater: mergeUpdaterGenerator<WalletState>()
+    };
+
+    const createWalletStore = () =>
+        createStore(
+            { Wallet: walletSection },
+            {
+                serializer: (object, _key, value) => {
+                    const original = object[_key];
+                    if (typeof original === 'bigint') {
+                        return BIGINT_PREFIX + original.toString();
+                    }
+                    if (original instanceof Date) {
+                        return DATE_PREFIX + original.toISOString();
+                    }
+                    return value;
+                },
+                deserializer: (_key, value) => {
+                    if (
+                        typeof value === 'string' &&
+                        value.startsWith(BIGINT_PREFIX)
+                    ) {
+                        return BigInt(value.slice(BIGINT_PREFIX.length));
+                    }
+                    if (
+                        typeof value === 'string' &&
+                        value.startsWith(DATE_PREFIX)
+                    ) {
+                        return new Date(value.slice(DATE_PREFIX.length));
+                    }
+                    return value;
+                },
+                persist: { key: 'test-key', storage }
+            }
+        );
+
+    const store1 = createWalletStore();
+    await store1.hydrate();
+    init(store1, 'Wallet', '/w');
+    store1.memo.Wallet['/w'].updater({
+        balance: BigInt(10),
+        createdAt: new Date(1000)
+    });
+    await store1.save();
+
+    const store2 = createWalletStore();
+    await store2.hydrate();
+
+    const restored = store2.state.Wallet['/w'];
+    assert.equal(typeof restored.balance, 'bigint');
+    assert.equal(restored.balance, BigInt(10));
+    assert.ok(restored.createdAt instanceof Date);
+    assert.equal(restored.createdAt.getTime(), 1000);
+});
+
+test('persistence: normalization fills fields missing from the stored snapshot', async () => {
+    const storage = createMockStorage();
+    await storage.setItem(
+        'test-key',
+        JSON.stringify({
+            state: { Dummy: { '/a': { count: 5 } } },
+            pathRegistry: {}
+        })
+    );
+
+    const store = createStore(
+        { Dummy: dummySection },
+        { persist: { key: 'test-key', storage } }
+    );
+    await store.hydrate();
+
+    const state = store.state.Dummy['/a'];
+    assert.equal(state.count, 5); // stored value preserved
+    assert.equal(state.text, ''); // missing fields filled from initialState
+    assert.equal(state.isLoading, false);
+});
