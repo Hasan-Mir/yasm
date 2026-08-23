@@ -1,28 +1,30 @@
 import dts from 'vite-plugin-dts';
-import { resolve } from 'node:path';
+import { resolve } from 'path';
 import { defineConfig } from 'vite';
-import react from '@vitejs/plugin-react';
 import * as packageJson from './package.json';
-import tsConfigPaths from 'vite-tsconfig-paths';
 
-// https://vitejs.dev/config/
-export default defineConfig(() => ({
-    plugins: [
-        tsConfigPaths(),
-        dts({
-            include: ['src/']
-        }),
-        react()
-    ],
+export default defineConfig({
+    plugins: [dts({ rollupTypes: true })],
     build: {
         lib: {
-            entry: resolve('src', 'index.ts'),
+            entry: resolve(__dirname, 'src/index.ts'),
             name: 'yasm',
             formats: ['es', 'umd'],
             fileName: format => `index.${format}.js`
         },
         rollupOptions: {
-            external: [...Object.keys(packageJson.peerDependencies)]
-        }
+            external: [
+                ...Object.keys(packageJson.peerDependencies || {}),
+                ...Object.keys(packageJson.dependencies || {})
+            ],
+            output: {
+                globals: {
+                    react: 'React',
+                    'react-dom': 'ReactDOM',
+                    immer: 'immer'
+                }
+            }
+        },
+        sourcemap: true
     }
-}));
+});

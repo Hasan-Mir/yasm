@@ -1,42 +1,24 @@
 import { YasmContext } from './Context';
 import { useCallback, useContext } from 'react';
-import { snapshot } from './util';
+import { PurgeOptions, purgeYasmState } from './purge';
 
+/**
+ * Returns a stable `purge(pathPrefix, options?)` function bound to the
+ * store found in context. See `purgeYasmState` for matching semantics,
+ * timing guidance, and warnings.
+ */
 const usePurgeYasmState = () => {
     const store = useContext(YasmContext);
+
+    if (store === undefined) {
+        throw new Error(
+            'YASM: no store was found in the React context. Wrap your component tree in <YasmContext.Provider value={store}>.'
+        );
+    }
+
     return useCallback(
-        (pathStartsWith: string) => {
-            if (process.env.NODE_ENV !== 'production') {
-                console.debug(`purging path starts with ${pathStartsWith}`);
-                console.debug('before:');
-                snapshot(store.state, store.debugOptions);
-            }
-            for (const name in store.state) {
-                for (const path in store.state[name]) {
-                    if (path.startsWith(pathStartsWith)) {
-                        delete store.state[name][path];
-                        delete store.subscribers[name][path];
-                    }
-                }
-            }
-            for (const name in store.memo) {
-                for (const path in store.memo[name]) {
-                    if (path.startsWith(pathStartsWith)) {
-                        delete store.memo[name][path];
-                    }
-                }
-            }
-            for (const name in store.pathRegistry) {
-                store.pathRegistry[name] = store.pathRegistry[name].filter(
-                    path => !path.startsWith(pathStartsWith)
-                );
-            }
-            if (process.env.NODE_ENV !== 'production') {
-                console.debug('after:');
-                snapshot(store.state, store.debugOptions);
-                console.debug('--------');
-            }
-        },
+        (pathPrefix: string, options?: PurgeOptions) =>
+            purgeYasmState(store, pathPrefix, options),
         [store]
     );
 };
