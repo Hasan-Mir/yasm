@@ -22,18 +22,21 @@
     "scripts": {
         "build": "vite build",
         "test": "tsx --test tests/*.test.ts",
+        "test:react": "vitest run",
         "typecheck": "tsc -p tsconfig.test.json",
         "prettier": "prettier --write src tests",
         "eslint": "eslint --fix src tests"
     },
     "dependencies": {
-        "immer": "11.1.15"
+        "immer": "^11.0.0"
     },
     "peerDependencies": {
-        "react": "^18.2.0 || ^19.0.0",
-        "react-dom": "^18.2.0 || ^19.0.0"
+        "react": "^18.0.0 || ^19.0.0",
+        "react-dom": "^18.0.0 || ^19.0.0"
     },
     "devDependencies": {
+        "@testing-library/jest-dom": "^7.0.1",
+        "@testing-library/react": "^14.3.1",
         "@types/node": "^26.1.2",
         "@types/react": "^18.2.43",
         "@types/react-dom": "^18.2.43",
@@ -42,12 +45,14 @@
         "eslint": "^8.55.0",
         "eslint-config-prettier": "^10.1.8",
         "eslint-plugin-react-hooks": "^7.1.1",
+        "jsdom": "^30.0.1",
         "prettier": "^3.9.6",
         "react": "^18.2.0",
         "react-dom": "^18.2.0",
         "tsx": "^4.23.1",
         "typescript": "^5.9.3",
         "vite": "^5.0.8",
-        "vite-plugin-dts": "^5.0.3"
+        "vite-plugin-dts": "^5.0.3",
+        "vitest": "^4.1.11"
     }
 }
