@@ -226,6 +226,7 @@ const init = <SM extends Record<Name, Section>, N extends keyof SM>(
         routedName,
         routedPath,
         getState: routedGetState,
+        getStateUnsafe: routedGetStateUnsafe,
         applyPayload
     } = route(store, name as Name, path);
 
@@ -278,7 +279,10 @@ const init = <SM extends Record<Name, Section>, N extends keyof SM>(
         }
         let currentState: any;
         try {
-            currentState = getState();
+            // Use the RAW (throwing) resolver here: a vanished routed element
+            // must turn the whole update into a no-op, not proceed against
+            // the reader's stale last-known snapshot.
+            currentState = routedGetStateUnsafe();
         } catch {
             return;
         }
@@ -372,7 +376,19 @@ const init = <SM extends Record<Name, Section>, N extends keyof SM>(
             for (const id of Object.keys(pathSubscribers)) {
                 const callback = pathSubscribers[id as unknown as number];
                 if (callback !== undefined) {
-                    callback();
+                    // 🔒 Isolate subscriber exceptions: one throwing callback
+                    // must not abort notification of the remaining ones.
+                    // This loop also reaches raw `store.subscribe` callbacks,
+                    // whose errors would otherwise silently break the update
+                    // fan-out for everyone else on this path.
+                    try {
+                        callback();
+                    } catch (error) {
+                        console.error(
+                            'YASM: a subscriber callback threw an exception. The error is isolated so other subscribers are still notified.',
+                            error
+                        );
+                    }
                 }
             }
         }
@@ -402,6 +418,8 @@ const route = <SM extends Record<Name, Section>>(
     routedName: Name;
     routedPath: Path;
     getState: () => any;
+    /** Raw (throwing) resolver used by the updater's own guard. */
+    getStateUnsafe: () => any;
     applyPayload: (payload: any) => any;
 } => {
     const state = store.state as Record<Name, Record<Path, any>>;
@@ -412,6 +430,7 @@ const route = <SM extends Record<Name, Section>>(
             routedName: name,
             routedPath: path,
             getState: () => state[name][path],
+            getStateUnsafe: () => state[name][path],
             applyPayload: payload =>
                 immer.produce(state[name][path], (draft: any) =>
                     store.sectionMap[name].updater(draft, payload)
@@ -423,7 +442,7 @@ const route = <SM extends Record<Name, Section>>(
     const routedName = steps[0].name;
     const routedPath = steps[0].path;
 
-    const getState = () => {
+    const resolveRoutedState = (): any => {
         let currentState: any = state[routedName][routedPath];
         for (let i = 0; i < steps.length - 1; i++) {
             const pathQuery = steps[i + 1].path.slice(steps[i].path.length);
@@ -432,6 +451,37 @@ const route = <SM extends Record<Name, Section>>(
             ].selectByPathQuery(currentState, pathQuery);
         }
         return currentState;
+    };
+
+    // Lifecycle safety for READERS: a routed element can disappear while a
+    // component is still subscribed to it (e.g. an ArraySection row removed
+    // through its parent). The generators' `selectByPathQuery` throws in that
+    // case, and `useSyncExternalStore` calls this getter during render — an
+    // unguarded throw there crashes the React tree.
+    //
+    // Semantics (deliberately asymmetric with the raw resolver below):
+    //  - A record that HAS resolved successfully before returns its LAST KNOWN
+    //    value when resolution starts failing (stable reference → no
+    //    getSnapshot churn; stale-until-unmount, matching the updater's
+    //    "safe no-op" philosophy).
+    //  - A record that NEVER resolved keeps the historical fail-fast behavior
+    //    so genuine routing misconfigurations (malformed or never-existing
+    //    paths) surface immediately instead of being masked by defaults.
+    let lastKnownState: any;
+
+    const getState = (): any => {
+        try {
+            const resolved = resolveRoutedState();
+            if (resolved !== undefined) {
+                lastKnownState = resolved;
+            }
+            return resolved;
+        } catch (error) {
+            if (lastKnownState !== undefined) {
+                return lastKnownState;
+            }
+            throw error;
+        }
     };
 
     const applyPayload = (payload: any) => {
@@ -456,7 +506,15 @@ const route = <SM extends Record<Name, Section>>(
         return update(0, state[routedName][routedPath]);
     };
 
-    return { routedName, routedPath, getState, applyPayload };
+    return {
+        routedName,
+        routedPath,
+        getState,
+        // Raw (throwing) resolver — used by the updater, whose own try/catch
+        // turns resolution failures into safe no-ops.
+        getStateUnsafe: resolveRoutedState,
+        applyPayload
+    };
 };
 
 /**

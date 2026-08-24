@@ -31,6 +31,15 @@ type PurgeOptions = {
  * event handlers, effects, timeouts, or tests. Inside React components you
  * can use the `usePurgeYasmState` hook, which simply binds this function to
  * the store in context.
+ *
+ * ⚠️ Routed paths: matching operates on PHYSICAL storage keys. A routed child
+ * (e.g. section `Cell` at logical path `/t[3]`) keeps its data inside its
+ * parent (`Table` at `/t`) and has no state of its own — purging the LOGICAL
+ * prefix `/t[3]` therefore only removes the child's memo record and leaves
+ * the parent's data untouched; it cannot surgically remove one element from
+ * the parent structure. Similarly, subscribers of routed children live under
+ * the parent's physical path, so lifecycle-aware APIs (`purgeWhenUnused`)
+ * observe the parent's subscription, not the logical child address.
  */
 const purgeYasmState = <SM extends Record<Name, Section>>(
     store: Store<SM>,

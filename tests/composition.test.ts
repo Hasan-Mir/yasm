@@ -362,3 +362,56 @@ test('custom routers compose sections with their own path syntax', () => {
     entry.updater({ label: 'updated' });
     assert.equal(store.state.Dict['/dict'], refBeforeNoop);
 });
+
+test('routed child reader does not throw when its backing element is removed', () => {
+    const store = makeStore();
+    init(store, 'Table', '/t');
+    store.memo.Table['/t'].updater({ addingItems: [{ id: 3 }], order: [3] });
+    init(store, 'Row', '/t[3]');
+    const row = store.memo.Row['/t[3]'];
+
+    // Reader resolves normally before the removal
+    assert.deepEqual(row.getState(), { title: '', done: false });
+
+    store.memo.Table['/t'].updater({ removingIDs: [3], order: [] });
+
+    // The updater is a guarded no-op; the reader must be lifecycle-safe too:
+    // it returns the LAST KNOWN value (stable reference, safe under uSES)
+    // instead of throwing during a render-phase getSnapshot call.
+    let result: unknown;
+    assert.doesNotThrow(() => {
+        result = row.getState();
+    });
+    assert.deepEqual(result, { title: '', done: false });
+
+    // A reader that NEVER resolved successfully keeps the historical
+    // fail-fast behavior: genuine routing misconfigurations must surface
+    // instead of being masked by a silent default.
+    const store2 = makeStore();
+    init(store2, 'Table', '/t');
+    init(store2, 'Row', '/t[7]'); // never initialized inside the parent
+    assert.throws(() => store2.memo.Row['/t[7]'].getState());
+});
+
+test('a throwing subscriber on one path does not block sibling notifications', () => {
+    const store = makeStore();
+    init(store, 'Table', '/t');
+
+    const seen: string[] = [];
+    const unsubBad = store.subscribe(() => {
+        throw new Error('boom');
+    }, 'Table', '/t');
+    const unsubGood = store.subscribe(() => {
+        seen.push('ok');
+    }, 'Table', '/t');
+
+    // Must not throw out of the update fan-out...
+    assert.doesNotThrow(() =>
+        store.memo.Table['/t'].updater({ addingItems: [{ id: 1 }] })
+    );
+    // ...and the healthy subscriber must still have been notified.
+    assert.deepEqual(seen, ['ok']);
+
+    unsubBad();
+    unsubGood();
+});

@@ -1554,3 +1554,136 @@ test('persistence: immediate purgeWhenUnused leaves no pending markers', async (
     assert.equal(saved.state.Dummy['/a'], undefined);
     assert.deepEqual(saved.metadata.pendingPurges, []);
 });
+
+test('persistence: a throwing raw subscriber does not quarantine valid data', async () => {
+    const storage = createMockStorage();
+    // A previous session persisted valid data.
+    await storage.setItem(
+        'test-key',
+        JSON.stringify({
+            state: { Dummy: { '/x': { count: 42, text: 'kept', isLoading: false } } },
+            pathRegistry: {},
+            metadata: { executedMigrations: [], pendingPurges: [] }
+        })
+    );
+
+    const store = createStore(
+        { Dummy: dummySection },
+        { persist: { key: 'test-key', storage } }
+    );
+
+    // App-style unguarded raw subscriber on a path that is never initialized
+    // (lazily created + omitted from persistence): it THROWS during the
+    // post-hydrate notification pass.
+    const unsubBad = store.subscribe(() => {
+        const s = store.state.Dummy['/never-initialized'];
+        if (s === undefined) throw new Error('unguarded mirror');
+    }, 'Dummy', '/mirror');
+
+    const notified: number[] = [];
+    const unsubGood = store.subscribe(() => notified.push(1), 'Dummy', '/x');
+
+    // hydrate() must resolve; the valid snapshot must NOT be quarantined...
+    await assert.doesNotReject(() => store.hydrate());
+    const keys: string[] = [];
+    storage.snapshot.forEach((_v, k) => keys.push(k));
+    assert.equal(
+        keys.find(k => k.includes('corrupted')),
+        undefined,
+        'valid persisted data must not be classified as corrupted'
+    );
+
+    // ...the merged value must be live in memory...
+    assert.equal(store.state.Dummy['/x']?.count, 42);
+    // ...and the healthy subscriber must still receive the post-hydrate notify.
+    assert.deepEqual(notified, [1]);
+
+    unsubBad();
+    unsubGood();
+});
+
+test('persistence: primitive/null persisted roots are quarantined and repaired', async () => {
+    for (const badRoot of ['null', '7', '"oops"']) {
+        const storage = createMockStorage();
+        await storage.setItem('test-key', badRoot);
+
+        const store = createStore(
+            { Dummy: dummySection },
+            { persist: { key: 'test-key', storage } }
+        );
+        await assert.doesNotReject(() => store.hydrate());
+
+        // Raw payload backed up untouched under a quarantine key...
+        const keys: string[] = [];
+        storage.snapshot.forEach((_v, k) => keys.push(k));
+        const backupKey = keys.find(
+            k => k.startsWith('test-key_corrupted_backup_')
+        );
+        assert.ok(backupKey, `expected a quarantine key for root ${badRoot}`);
+        assert.equal(await storage.getItem(backupKey as string), badRoot);
+
+        // ...and the primary key overwritten with a clean snapshot.
+        const cleaned = JSON.parse((await storage.getItem('test-key')) as string);
+        assert.deepEqual(cleaned.state, { Dummy: {} });
+        assert.equal(store.isHydrated(), true);
+    }
+});
+
+test('persistence: normalization repair-saves fields added from initialState', async () => {
+    const storage = createMockStorage();
+    // Snapshot from an OLDER schema: `isLoading` did not exist yet.
+    await storage.setItem(
+        'test-key',
+        JSON.stringify({
+            state: { Dummy: { '/x': { count: 3, text: 'old' } } },
+            pathRegistry: {},
+            metadata: { executedMigrations: [], pendingPurges: [] }
+        })
+    );
+
+    const store = createStore(
+        { Dummy: dummySection },
+        { persist: { key: 'test-key', storage } }
+    );
+    await store.hydrate();
+
+    // In-memory state healed AND persisted back — no re-heal next launch.
+    const saved = JSON.parse((await storage.getItem('test-key')) as string);
+    assert.deepEqual(saved.state.Dummy['/x'], {
+        count: 3,
+        text: 'old',
+        isLoading: false
+    });
+});
+
+test('persistence: normalize-hook sections do not force a repair-save when nothing changed', async () => {
+    const storage = createMockStorage();
+    const store1 = createStore(
+        { Table: tableSection },
+        { persist: { key: 'test-key', storage } }
+    );
+    await store1.hydrate();
+    init(store1, 'Table', '/t');
+    store1.memo.Table['/t'].updater({ addingItems: [{ id: 1 }] });
+    await store1.save();
+    const beforeSave = await storage.getItem('test-key');
+
+    // Fresh store, same storage: hydration normalizes but changes nothing,
+    // so NO repair-save may run (the serialized snapshot stays identical).
+    const store2 = createStore(
+        { Table: tableSection },
+        { persist: { key: 'test-key', storage } }
+    );
+    let saveCalls = 0;
+    const origSetItem = storage.setItem.bind(storage);
+    storage.setItem = async (k: string, v: string) => {
+        saveCalls++;
+        return origSetItem(k, v);
+    };
+
+    await store2.hydrate();
+    assert.equal(saveCalls, 0, 'unchanged normalize output must not trigger a repair-save');
+
+    const afterHydrate = await storage.getItem('test-key');
+    assert.equal(afterHydrate, beforeSave);
+});

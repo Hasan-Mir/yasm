@@ -35,9 +35,16 @@ type PayloadAndPayloadCreator<
  *   unchanged parent state aborts the whole update (reference-equality
  *   fast path).
  *
- * Any remaining query returned by `selectByPathQuery` is passed on to the
- * child section's own routing — so routers compose recursively and
- * multi-level nesting works.
+ * ⚠️ NOTE on composition mechanics: although `selectByPathQuery` returns a
+ * `[state, remainedPathQuery]` tuple, the engine currently DISCARDS the
+ * returned remainder. Instead, the child query for each hop is derived by
+ * slicing the registered routing paths against each other
+ * (`childPath.slice(parentPath.length)`), which relies on every intermediate
+ * route being present in `pathRegistry`. The built-in Array/Object section
+ * generators always return an empty remainder, so they compose correctly.
+ * A custom router that returns a NON-empty remainder and expects it to be
+ * forwarded to the next hop will NOT have it forwarded — address nested
+ * levels through registry-registered parent paths instead.
  */
 type Router<S = any, NS = any> = {
     selectByPathQuery: (
@@ -777,6 +784,23 @@ const createStore = <SM extends Record<Name, Section>>(
     // Callbacks only trigger re-reads (`getState`), never writes, so a
     // snapshot copy of the records is enough to stay safe against
     // synchronous unsubscriptions mid-loop.
+    // 🔒 Subscriber isolation: a callback that throws must never (a) abort
+    // notification of the remaining subscribers, nor (b) escape into the
+    // hydration error boundary — the post-hydrate notification pass runs
+    // inside `hydrate()`'s try/catch, and an escaping error there would
+    // misclassify VALID persisted data as "corrupted" and quarantine it.
+    // User subscriber exceptions are logged and swallowed instead.
+    const safeInvokeSubscriber = (callback: () => void) => {
+        try {
+            callback();
+        } catch (error) {
+            console.error(
+                'YASM: a subscriber callback threw an exception. The error is isolated so other subscribers are still notified.',
+                error
+            );
+        }
+    };
+
     const notifyAllSubscribers = () => {
         for (const name of Object.keys(subscribers)) {
             const sectionSubscribers = (
@@ -794,7 +818,10 @@ const createStore = <SM extends Record<Name, Section>>(
                     continue;
                 }
                 for (const id of Object.keys(record)) {
-                    record[id as unknown as number]?.();
+                    const callback = record[id as unknown as number];
+                    if (callback !== undefined) {
+                        safeInvokeSubscriber(callback);
+                    }
                 }
             }
         }
@@ -1080,13 +1107,20 @@ const createStore = <SM extends Record<Name, Section>>(
 
                         // A valid storage read may still contain a JSON
                         // primitive (for example, an old or corrupted
-                        // snapshot containing `null`). Treat it as an empty
-                        // snapshot, but continue through the lifecycle so the
-                        // store becomes hydrated and `onHydrated` is called.
+                        // snapshot containing `null`, a number or a string).
+                        // Per the documented corruption contract, hand it to
+                        // the quarantine flow below: the raw payload is backed
+                        // up under `<key>_corrupted_backup_<timestamp>` and the
+                        // primary key is overwritten with a clean snapshot.
+                        // (`rawData` is truthy here, so an empty/fresh storage
+                        // never reaches this branch.)
                         if (!parsed || typeof parsed !== 'object') {
-                            isStateChangedDuringHydration = false;
-                        } else {
-                            if (parsed.state === undefined) {
+                            throw new Error(
+                                'YASM: the persisted snapshot root is not an object.'
+                            );
+                        }
+
+                        if (parsed.state === undefined) {
                                 parsed.state = {};
                             }
 
@@ -1214,6 +1248,34 @@ const createStore = <SM extends Record<Name, Section>>(
                                     : true;
 
                             if (shouldNormalize) {
+                                // Compares persisted values by their serialized
+                                // form (using the store's serializer so custom
+                                // types like BigInt/Decimal/Date are tagged
+                                // consistently). Returns undefined when
+                                // serialization fails — callers treat that as
+                                // "changed" (conservative).
+                                const serializeForCompare = (value: any) => {
+                                    try {
+                                        return JSON.stringify(
+                                            value,
+                                            function (key, val) {
+                                                return options?.serializer
+                                                    ? options.serializer(
+                                                          this as Record<
+                                                              string,
+                                                              unknown
+                                                          >,
+                                                          key,
+                                                          val
+                                                      )
+                                                    : val;
+                                            }
+                                        );
+                                    } catch {
+                                        return undefined;
+                                    }
+                                };
+
                                 // Extract the core normalization logic for reuse in nested sections
                                 const defaultNormalize = (
                                     storedVal: any,
@@ -1225,6 +1287,11 @@ const createStore = <SM extends Record<Name, Section>>(
                                         typeof storedVal !== 'object' ||
                                         Array.isArray(storedVal)
                                     ) {
+                                        // The stored shape does not match the
+                                        // object-shaped initialState at all —
+                                        // the returned replacement differs from
+                                        // what is on disk, so persist it back.
+                                        isStateChangedDuringHydration = true;
                                         return { ...initialVal };
                                     }
 
@@ -1240,6 +1307,26 @@ const createStore = <SM extends Record<Name, Section>>(
                                                 isStateChangedDuringHydration = true;
                                             }
                                         });
+                                    }
+
+                                    // Additive healing: keys that exist in the
+                                    // current initialState but are missing from
+                                    // the stored snapshot were just backfilled.
+                                    // The in-memory state is correct now, but it
+                                    // differs from what is on disk — mark the
+                                    // hydration as changed so the repair-save
+                                    // persists the healed value instead of
+                                    // re-healing it on every launch. (Only
+                                    // reachable when storedVal was an object;
+                                    // the primitive branch above replaces the
+                                    // whole value and is handled by callers.)
+                                    if (storedVal && typeof storedVal === 'object' && !Array.isArray(storedVal)) {
+                                        for (const key of Object.keys(initialVal)) {
+                                            if (!(key in storedVal)) {
+                                                isStateChangedDuringHydration = true;
+                                                break;
+                                            }
+                                        }
                                     }
 
                                     if (typeof norm === 'object') {
@@ -1315,13 +1402,29 @@ const createStore = <SM extends Record<Name, Section>>(
 
                                                 // Delegate to the section's own normalizer when available (such as ArraySection)
                                                 if (section.normalize) {
+                                                    // Snapshot the persisted
+                                                    // form BEFORE normalizing:
+                                                    // a normalize hook may
+                                                    // mutate `storedValue` in
+                                                    // place, which would taint
+                                                    // an afterwards-only
+                                                    // comparison.
+                                                    const beforeJson = serializeForCompare(storedValue);
                                                     storedSection[path] =
                                                         section.normalize(
                                                             storedValue,
                                                             context
                                                         );
-                                                    // Assume dynamic structures changed so they are persisted when necessary
-                                                    isStateChangedDuringHydration = true;
+                                                    // Only mark the hydration as changed when normalization actually
+                                                    // altered the persisted value — previously this was flagged
+                                                    // unconditionally, forcing a full repair-save on every boot for
+                                                    // every generated (Array/Object) section even when nothing changed.
+                                                    if (
+                                                        beforeJson === undefined ||
+                                                        beforeJson !== serializeForCompare(storedSection[path])
+                                                    ) {
+                                                        isStateChangedDuringHydration = true;
+                                                    }
                                                 } else {
                                                     // Otherwise, use the default normalizer
                                                     storedSection[path] =
@@ -1388,7 +1491,6 @@ const createStore = <SM extends Record<Name, Section>>(
                             // replaced) state instead of showing the lazy
                             // default forever.
                             notifyAllSubscribers();
-                        }
                     } else if (p.migrations) {
                         // 🛡️ Fresh install (empty storage): natively created
                         // state already matches the current schema, so every

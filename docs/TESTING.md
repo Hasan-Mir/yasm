@@ -65,8 +65,10 @@ supports `key`, `storage`, static/function `omitSections`, boolean/function
   capturing a call-time shallow copy of the state and registry.
 - `hydrationPromise`: single-flight promise reused by concurrent hydration calls.
 - `isHydrated`: blocks pre-hydration saves and autosave scheduling, then stays true.
-- `hydrationSuccess`: gates saves after a failed (quarantined) hydration so the
-  corrupted database is never overwritten with in-memory state in that session.
+- `hydrationSuccess`: unlocked at the end of EVERY hydrate run — including a
+  failed (quarantined) one — so users can save again afterwards. The
+  quarantine flow itself immediately overwrites the corrupted primary key
+  with a clean snapshot via the post-hydration repair-save.
 - `executedMigrations`: in-memory migration IDs restored from and written to
   metadata; on an empty storage read, every configured migration is marked
   immediately because natively created state matches the current schema.
