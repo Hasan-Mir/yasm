@@ -1,3 +1,6 @@
+import { isPathWithinPrefix } from './util';
+import { purgeYasmState, type PurgeOptions } from './purge';
+
 type Name = string;
 type Path = string;
 
@@ -305,6 +308,17 @@ type PersistedSnapshot<SM extends Record<Name, Section>> = {
     pathRegistry: Partial<Record<Name, Path[]>>;
     metadata?: {
         executedMigrations?: string[];
+        /**
+         * Deferred purges that were decided but still waiting for their last
+         * subscriber when the snapshot was written. Re-scheduled (and, with
+         * no consumers mounted, executed immediately) during the next
+         * hydration — so a refresh inside a pending window can never leave
+         * orphaned state behind.
+         */
+        pendingPurges?: {
+            pathPrefix: string;
+            match?: 'segment' | 'startsWith' | undefined;
+        }[];
     };
 };
 
@@ -437,7 +451,34 @@ type StoreOptions<SM extends Record<Name, Section>> = {
     deserializer?: (key: string, value: unknown) => any;
 };
 
+/**
+ * Internal notification dispatched by YASM whenever something meaningful
+ * happened to the store data:
+ *
+ * - a state update produced a **new** state reference (no-op updates skip it),
+ * - a raw `purge()` actually removed state or registry entries,
+ * - a deferred `purgeWhenUnused` fired.
+ *
+ * The store uses it to trigger two side effects, in order:
+ *
+ * 1. the user-facing `onStateChange` callback,
+ * 2. the debounced autosave (only after hydration finished).
+ *
+ * It deliberately does NOT notify React subscribers — those are notified per
+ * `(section, path)` directly by the updater/purge code paths. Hidden via
+ * Symbol so application code cannot call it accidentally.
+ */
 const SYMBOL_NOTIFY_CHANGE = Symbol('YASM_NOTIFY_CHANGE');
+
+/**
+ * Internal notification used by `purgeYasmState`: a matched path's subscriber
+ * record was removed directly (without a normal unsubscribe), so deferred
+ * purges waiting on that path must reconcile their bookkeeping instead of
+ * leaking forever.
+ */
+const SYMBOL_NOTIFY_FORCED_UNSUBSCRIBE = Symbol(
+    'YASM_NOTIFY_FORCED_UNSUBSCRIBE'
+);
 
 /**
  * The store instance returned by `createStore`.
@@ -485,16 +526,53 @@ type Store<SM extends Record<Name, Section> = Record<Name, Section>> = {
     save: () => Promise<void>;
 
     /**
+     * Lifecycle-safe purge: schedules the destruction of every path matching
+     * `pathPrefix` for the moment its last subscriber unsubscribes — or
+     * executes it immediately when nothing is subscribed at call time.
+     *
+     * Unlike raw `purgeYasmState`, this never races React's asynchronous
+     * unmounting, never warns, and re-verifies live subscribers at fire time
+     * so revived or newly created paths (with mounted readers) under the
+     * prefix are never wiped. ⚠️ Detection is subscription-based: a path
+     * recreated between scheduling and firing purely through write-only
+     * hooks (`useYasmStateUpdater`, which never subscribes) is invisible to
+     * the re-verification and is destroyed with the rest of the prefix.
+     * Unmounting alone never purges — the decision always stays with the
+     * caller. Pending purges are persisted in snapshot metadata and
+     * re-scheduled (executed immediately, since consumers are not mounted
+     * yet) during the next hydration.
+     */
+    purgeWhenUnused: (pathPrefix: string, options?: PurgeOptions) => void;
+
+    /**
      * Internal method used to trigger change listeners and persistence mechanisms
      * immediately after a state mutation or purge. Hidden via Symbol.
      */
     [SYMBOL_NOTIFY_CHANGE]: () => void;
+
+    /**
+     * Internal method used by `purgeYasmState` to inform the deferred-purge
+     * engine that a path's subscriber record was removed without a normal
+     * unsubscribe. Hidden via Symbol.
+     */
+    [SYMBOL_NOTIFY_FORCED_UNSUBSCRIBE]: (name: Name, path: Path) => void;
 } & Required<
     Pick<StoreOptions<SM>, 'serializer' | 'deserializer' | 'debugOptions'>
 >;
 
 /** The default path segment boundaries: `'/'`, `'['` and `'.'`. */
 const DEFAULT_PATH_BOUNDARY_CHARS = ['/', '[', '.'];
+
+/** Internal bookkeeping for one deferred `purgeWhenUnused` schedule. */
+type PendingPurge = {
+    pathPrefix: string;
+    match?: 'segment' | 'startsWith' | undefined;
+    /**
+     * `${name}\u0000${path}` keys of matching paths that still had
+     * subscribers when the purge was scheduled (or at the last re-snapshot).
+     */
+    pendingKeys: Set<string>;
+};
 
 /**
  * Creates a YASM store from a section map.
@@ -558,6 +636,112 @@ const createStore = <SM extends Record<Name, Section>>(
     // Maintain executed migrations metadata in memory (not in state)
     let executedMigrations = new Set<string>();
 
+    // 🧹 Deferred purges (`purgeWhenUnused`): the app decides a subtree's
+    // state is dead; the library destroys it at the first safe moment — the
+    // instant the last subscriber of every matching path unsubscribes.
+    let pendingPurges: PendingPurge[] = [];
+
+    const SUBSCRIBER_KEY_SEPARATOR = '\u0000';
+    const subscriberKey = (name: string, path: string) =>
+        `${name}${SUBSCRIBER_KEY_SEPARATOR}${path}`;
+
+    const pathMatchesEntry = (path: string, entry: PendingPurge) =>
+        entry.match === 'startsWith'
+            ? path.startsWith(entry.pathPrefix)
+            : isPathWithinPrefix(path, entry.pathPrefix, boundaryChars);
+
+    const collectSubscribedKeys = (
+        pathPrefix: string,
+        match: PurgeOptions['match']
+    ) => {
+        const keys = new Set<string>();
+        for (const name of Object.keys(subscribers)) {
+            const sectionSubscribers = (
+                subscribers as Record<
+                    string,
+                    Record<Path, Record<number, () => void>>
+                >
+            )[name];
+
+            for (const path of Object.keys(sectionSubscribers)) {
+                if (Object.keys(sectionSubscribers[path]).length === 0) {
+                    continue;
+                }
+                const isMatch =
+                    match === 'startsWith'
+                        ? path.startsWith(pathPrefix)
+                        : isPathWithinPrefix(path, pathPrefix, boundaryChars);
+                if (isMatch) {
+                    keys.add(subscriberKey(name, path));
+                }
+            }
+        }
+        return keys;
+    };
+
+    const firePendingPurge = (store: Store<SM>, entry: PendingPurge) => {
+        // 🔒 Re-verify against LIVE subscribers before destroying: paths that
+        // were revived (e.g. a deleted row restored by a refetch) or newly
+        // created under the prefix after scheduling must never be wiped —
+        // re-snapshot and keep waiting instead.
+        const liveKeys = collectSubscribedKeys(entry.pathPrefix, entry.match);
+        if (liveKeys.size > 0) {
+            entry.pendingKeys = liveKeys;
+            return;
+        }
+
+        pendingPurges = pendingPurges.filter(pending => pending !== entry);
+        purgeYasmState(
+            store,
+            entry.pathPrefix,
+            entry.match === 'startsWith' ? { match: 'startsWith' } : undefined
+        );
+    };
+
+    const handleLastSubscriberLeft = (
+        store: Store<SM>,
+        name: string,
+        path: string
+    ) => {
+        if (pendingPurges.length === 0) {
+            return;
+        }
+
+        const key = subscriberKey(name, path);
+        for (const entry of [...pendingPurges]) {
+            if (!pathMatchesEntry(path, entry)) {
+                continue;
+            }
+            entry.pendingKeys.delete(key);
+            if (entry.pendingKeys.size === 0) {
+                firePendingPurge(store, entry);
+            }
+        }
+    };
+
+    const schedulePurgeWhenUnused = (
+        store: Store<SM>,
+        pathPrefix: string,
+        match: PurgeOptions['match']
+    ) => {
+        const pendingKeys = collectSubscribedKeys(pathPrefix, match);
+        if (pendingKeys.size === 0) {
+            // Nobody is subscribed right now — safe to destroy immediately.
+            purgeYasmState(
+                store,
+                pathPrefix,
+                match === 'startsWith' ? { match: 'startsWith' } : undefined
+            );
+            return;
+        }
+
+        // Replace any previous schedule for the same prefix (fresh snapshot).
+        pendingPurges = pendingPurges.filter(
+            entry => entry.pathPrefix !== pathPrefix || entry.match !== match
+        );
+        pendingPurges.push({ pathPrefix, match, pendingKeys });
+    };
+
     return {
         state: names.reduce((pre, name) => {
             pre[name] = {};
@@ -565,7 +749,7 @@ const createStore = <SM extends Record<Name, Section>>(
         }, {} as StateBySectionMap<SM>),
         subscribers,
         sectionMap,
-        subscribe: (callback, name, path) => {
+        subscribe(callback, name, path) {
             const sectionSubscribers = subscribers[name] as
                 Record<Path, Record<number, () => void>> | undefined;
 
@@ -583,6 +767,7 @@ const createStore = <SM extends Record<Name, Section>>(
                     [id]: callback
                 };
             }
+
             return () => {
                 // Tolerant unsubscribe: it must not warn or
                 // crash here. The "purged while components are still mounted"
@@ -595,6 +780,12 @@ const createStore = <SM extends Record<Name, Section>>(
 
                 if (record !== undefined) {
                     delete record[id];
+
+                    // 🧹 The last subscriber of this path just left — give
+                    // deferred purges waiting on it a chance to fire.
+                    if (Object.keys(record).length === 0) {
+                        handleLastSubscriberLeft(this, name.toString(), path);
+                    }
                 }
             };
         },
@@ -702,7 +893,15 @@ const createStore = <SM extends Record<Name, Section>>(
                 state: stateToSave,
                 pathRegistry: pathRegistryToSave,
                 metadata: {
-                    executedMigrations: Array.from(executedMigrations)
+                    executedMigrations: Array.from(executedMigrations),
+                    // Persist pending deferred purges so a refresh in the
+                    // middle of a pending window cannot orphan state — the
+                    // next hydration re-schedules (and, with nothing mounted,
+                    // immediately executes) them.
+                    pendingPurges: pendingPurges.map(entry => ({
+                        pathPrefix: entry.pathPrefix,
+                        match: entry.match
+                    }))
                 }
             };
 
@@ -746,6 +945,14 @@ const createStore = <SM extends Record<Name, Section>>(
             return saveQueue;
         },
 
+        /**
+         * Lifecycle-safe purge — see the `Store` type docs. Fires when the
+         * last matching subscriber leaves (or immediately when unused).
+         */
+        purgeWhenUnused(pathPrefix: string, options?: PurgeOptions) {
+            schedulePurgeWhenUnused(this, pathPrefix, options?.match);
+        },
+
         hydrate() {
             // Return existing promise if already hydrating (Single-flight / Idempotency)
             if (hydrationPromise) {
@@ -763,6 +970,10 @@ const createStore = <SM extends Record<Name, Section>>(
                 }
 
                 let rawData: string | null | unknown = null;
+                let persistedPendingPurges: {
+                    pathPrefix: string;
+                    match?: 'segment' | 'startsWith' | undefined;
+                }[] = [];
 
                 try {
                     rawData = await p.storage.getItem(p.key);
@@ -791,6 +1002,18 @@ const createStore = <SM extends Record<Name, Section>>(
                             // Initialize metadata and executed migrations tracking
                             executedMigrations = new Set<string>(
                                 parsed.metadata?.executedMigrations || []
+                            );
+
+                            // Capture deferred purges persisted by the
+                            // previous session; re-scheduled after the merge.
+                            const metadataPendingPurges =
+                                parsed.metadata?.pendingPurges;
+                            persistedPendingPurges = (
+                                Array.isArray(metadataPendingPurges)
+                                    ? metadataPendingPurges
+                                    : []
+                            ).filter(
+                                entry => typeof entry?.pathPrefix === 'string'
                             );
 
                             // 1. Run Managed Schema Migrations
@@ -1043,6 +1266,27 @@ const createStore = <SM extends Record<Name, Section>>(
                                         Array.from(existingPaths);
                                 }
                             );
+
+                            // 7. Re-schedule deferred purges persisted by the
+                            // previous session. Consumers are not mounted yet
+                            // (hydrate gates rendering), so nothing is
+                            // subscribed and they execute immediately — a
+                            // refresh inside a pending window can never orphan
+                            // state, and pre-purge snapshots self-heal.
+                            if (persistedPendingPurges.length > 0) {
+                                for (const pending of persistedPendingPurges) {
+                                    this.purgeWhenUnused(
+                                        pending.pathPrefix,
+                                        pending.match === 'startsWith'
+                                            ? { match: 'startsWith' }
+                                            : undefined
+                                    );
+                                }
+
+                                // Persist the purged snapshot (and clear the
+                                // pending markers) through the repair-save.
+                                isStateChangedDuringHydration = true;
+                            }
                         }
                     } else if (p.migrations) {
                         // 🛡️ Fresh install (empty storage): natively created
@@ -1125,6 +1369,10 @@ const createStore = <SM extends Record<Name, Section>>(
             })();
 
             return hydrationPromise;
+        },
+
+        [SYMBOL_NOTIFY_FORCED_UNSUBSCRIBE](name: Name, path: Path) {
+            handleLastSubscriberLeft(this, name.toString(), path);
         },
 
         [SYMBOL_NOTIFY_CHANGE]: async function () {
@@ -1212,4 +1460,9 @@ export type {
     PersistedSnapshot,
     YasmPersistenceAdapter
 };
-export { createStore, SYMBOL_NOTIFY_CHANGE, DEFAULT_PATH_BOUNDARY_CHARS };
+export {
+    createStore,
+    SYMBOL_NOTIFY_CHANGE,
+    SYMBOL_NOTIFY_FORCED_UNSUBSCRIBE,
+    DEFAULT_PATH_BOUNDARY_CHARS
+};

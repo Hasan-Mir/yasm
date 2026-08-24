@@ -4,7 +4,7 @@ import { createStore, Section } from '../src/createStore';
 import { mergeUpdaterGenerator, arraySectionGenerator } from '../src/util';
 import { init } from '../src/useYasmState';
 import { purgeYasmState } from '../src/purge';
-import { captureConsole } from './helpers';
+import { captureConsole, captureWarnings } from './helpers';
 
 // 🧪 Mock Storage Adapter
 const createMockStorage = () => {
@@ -1468,4 +1468,89 @@ test('persistence: duplicate migration ids within a section throw at store creat
             }
         )
     );
+});
+
+test('persistence: pending purgeWhenUnused entries are persisted and drained on hydration', async () => {
+    const storage = createMockStorage();
+
+    // Session 1: '/b' is subscribed → its purge stays pending
+    const store1 = createStore(
+        { Dummy: dummySection },
+        { persist: { key: 'test-key', storage } }
+    );
+    await store1.hydrate();
+    init(store1, 'Dummy', '/b');
+    const unsubscribe = store1.memo.Dummy['/b'].subscribe(() => undefined);
+
+    store1.purgeWhenUnused('/b');
+    await store1.save();
+
+    const saved = JSON.parse((await storage.getItem('test-key')) as string);
+    assert.deepEqual(saved.metadata.pendingPurges, [{ pathPrefix: '/b' }]);
+    assert.notEqual(
+        saved.state.Dummy['/b'],
+        undefined,
+        'state must be kept while a subscriber is attached'
+    );
+
+    unsubscribe();
+
+    // Session 2: nothing is mounted — the persisted pending purge executes
+    // during hydration, and the repair-save clears the marker
+    const store2 = createStore(
+        { Dummy: dummySection },
+        { persist: { key: 'test-key', storage } }
+    );
+    await store2.hydrate();
+
+    assert.equal(store2.state.Dummy['/b'], undefined);
+    const after = JSON.parse((await storage.getItem('test-key')) as string);
+    assert.equal(after.state.Dummy['/b'], undefined);
+    assert.deepEqual(after.metadata.pendingPurges, []);
+});
+
+test('persistence: raw purge over a pending purgeWhenUnused drains the pending marker', async () => {
+    const storage = createMockStorage();
+    const store = createStore(
+        { Dummy: dummySection },
+        { persist: { key: 'test-key', storage } }
+    );
+    await store.hydrate();
+
+    init(store, 'Dummy', '/b');
+    const unsubscribe = store.memo.Dummy['/b'].subscribe(() => undefined);
+
+    store.purgeWhenUnused('/b'); // pends: /b is subscribed
+
+    // A raw purge destroys the subscriber record directly (with a warning).
+    // The pending entry must reconcile its bookkeeping instead of leaking
+    // into every future snapshot's metadata.
+    await captureWarnings(() => purgeYasmState(store, '/b'));
+
+    await store.save();
+    const saved = JSON.parse((await storage.getItem('test-key')) as string);
+    assert.deepEqual(saved.metadata.pendingPurges, []);
+    assert.equal(saved.state.Dummy['/b'], undefined);
+
+    // The late unsubscribe is a tolerant no-op and must not resurrect anything
+    unsubscribe();
+    assert.equal(store.state.Dummy['/b'], undefined);
+});
+
+test('persistence: immediate purgeWhenUnused leaves no pending markers', async () => {
+    const storage = createMockStorage();
+    const store = createStore(
+        { Dummy: dummySection },
+        { persist: { key: 'test-key', storage } }
+    );
+    await store.hydrate();
+    init(store, 'Dummy', '/a');
+
+    // No subscribers → the purge executes immediately, nothing pends
+    store.purgeWhenUnused('/a');
+    await store.save();
+
+    const saved = JSON.parse((await storage.getItem('test-key')) as string);
+    assert.equal(saved.state.Dummy['/a'], undefined);
+    assert.deepEqual(saved.metadata.pendingPurges, []);
 });

@@ -1,6 +1,7 @@
 import { isPathWithinPrefix, snapshot } from './util';
 import {
     SYMBOL_NOTIFY_CHANGE,
+    SYMBOL_NOTIFY_FORCED_UNSUBSCRIBE,
     Name,
     Path,
     Store,
@@ -121,7 +122,15 @@ const purgeYasmState = <SM extends Record<Name, Section>>(
                 continue;
             }
 
-            const activeCount = Object.keys(sectionSubscribers[path]).length;
+            // Re-read the record defensively: a pending purge fired by the
+            // forced-unsubscribe notification below can run a nested purge
+            // that already deleted this record mid-loop.
+            const record = sectionSubscribers[path];
+            if (record === undefined) {
+                continue;
+            }
+
+            const activeCount = Object.keys(record).length;
 
             if (activeCount > 0) {
                 console.warn(
@@ -135,6 +144,11 @@ const purgeYasmState = <SM extends Record<Name, Section>>(
 
             delete sectionSubscribers[path];
             purgedPaths?.add(path);
+
+            // 🧹 The record was removed without a normal unsubscribe — let
+            // any deferred `purgeWhenUnused` waiting on this path reconcile
+            // its bookkeeping (and fire if it was the last tracked key).
+            store[SYMBOL_NOTIFY_FORCED_UNSUBSCRIBE](name, path);
         }
     }
 

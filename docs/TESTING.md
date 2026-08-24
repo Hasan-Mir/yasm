@@ -9,21 +9,22 @@ runtime is present in `package.json`.
 
 The package entry point (`src/index.ts`) exposes the following runtime values:
 
-| API                                               | Contract and options                                                                                                                                                                                      |
-| ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `createStore(sectionMap, options?)`               | Creates a lazy, path-indexed store. `options` supports `debugOptions`, `pathBoundaryChars`, `onStateChange`, `persist`, `serializer`, and `deserializer`.                                                 |
-| `DEFAULT_PATH_BOUNDARY_CHARS`                     | `['/', '[', '.']`; used by segment-aware routing and purge matching.                                                                                                                                      |
-| `YasmContext`                                     | React context whose provider value is a store.                                                                                                                                                            |
-| `useYasmState(name, path, selectorOrOptions?)`    | Returns `[stateOrSelection, updater]`. The third argument is either a selector or `{ selector?, overrideInitialState? }`. The override is an object or callback and applies only on first initialization. |
-| `useYasmStateUpdater(name, path)`                 | Returns only the updater for `(name, path)` without subscribing the component — the store never notifies it, so it never re-renders.                                                                      |
-| `usePurgeYasmState()`                             | Returns `(pathPrefix, options?) => void`.                                                                                                                                                                 |
-| `purgeYasmState(store, pathPrefix, options?)`     | Removes matching state, subscribers, memo records, and routing registrations. `PurgeOptions.match` is `'segment'` (default) or `'startsWith'`.                                                            |
-| `arraySectionGenerator(childName, childSection)`  | Creates `{ order, map }` state with `order`, `addingItems`, `editingItems`, and `removingIDs` updater operations and child routing via `[id]`.                                                            |
-| `objectSectionGenerator(sectionMap)`              | Composes named child definitions; child routing uses `[childKey]`.                                                                                                                                        |
-| `propertyUpdaterGenerator<S>()`                   | Returns an updater accepting `{ key, value }`; unchanged values preserve identity.                                                                                                                        |
-| `mergeUpdaterGenerator<S>()`                      | Returns a shallow `Partial<S>` updater; unchanged payloads preserve identity.                                                                                                                             |
-| `getFieldSetter(updateState, field)`              | Returns a cached field setter accepting a value or previous-value callback.                                                                                                                               |
-| `isPathWithinPrefix(path, prefix, boundaryChars)` | Segment-aware prefix test; empty prefix matches every path.                                                                                                                                               |
+| API                                               | Contract and options                                                                                                                                                                                                                                                                       |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `createStore(sectionMap, options?)`               | Creates a lazy, path-indexed store. `options` supports `debugOptions`, `pathBoundaryChars`, `onStateChange`, `persist`, `serializer`, and `deserializer`.                                                                                                                                  |
+| `DEFAULT_PATH_BOUNDARY_CHARS`                     | `['/', '[', '.']`; used by segment-aware routing and purge matching.                                                                                                                                                                                                                       |
+| `YasmContext`                                     | React context whose provider value is a store.                                                                                                                                                                                                                                             |
+| `useYasmState(name, path, selectorOrOptions?)`    | Returns `[stateOrSelection, updater]`. The third argument is either a selector or `{ selector?, overrideInitialState? }`. The override is an object or callback and applies only on first initialization.                                                                                  |
+| `useYasmStateUpdater(name, path)`                 | Returns only the updater for `(name, path)` without subscribing the component — the store never notifies it, so it never re-renders.                                                                                                                                                       |
+| `usePurgeYasmState()`                             | Returns `(pathPrefix, options?) => void`.                                                                                                                                                                                                                                                  |
+| `usePurgeWhenUnused()`                            | Returns `(pathPrefix, options?) => void` bound to `store.purgeWhenUnused` — the lifecycle-safe purge that fires once the last matching subscriber unsubscribes (or immediately when unused), re-verifies live subscribers at fire time, and persists pending entries in snapshot metadata. |
+| `purgeYasmState(store, pathPrefix, options?)`     | Removes matching state, subscribers, memo records, and routing registrations. `PurgeOptions.match` is `'segment'` (default) or `'startsWith'`.                                                                                                                                             |
+| `arraySectionGenerator(childName, childSection)`  | Creates `{ order, map }` state with `order`, `addingItems`, `editingItems`, and `removingIDs` updater operations and child routing via `[id]`.                                                                                                                                             |
+| `objectSectionGenerator(sectionMap)`              | Composes named child definitions; child routing uses `[childKey]`.                                                                                                                                                                                                                         |
+| `propertyUpdaterGenerator<S>()`                   | Returns an updater accepting `{ key, value }`; unchanged values preserve identity.                                                                                                                                                                                                         |
+| `mergeUpdaterGenerator<S>()`                      | Returns a shallow `Partial<S>` updater; unchanged payloads preserve identity.                                                                                                                                                                                                              |
+| `getFieldSetter(updateState, field)`              | Returns a cached field setter accepting a value or previous-value callback.                                                                                                                                                                                                                |
+| `isPathWithinPrefix(path, prefix, boundaryChars)` | Segment-aware prefix test; empty prefix matches every path.                                                                                                                                                                                                                                |
 
 The entry point also exports TypeScript contracts: `Name`, `Path`, `Updater`,
 `PayloadAndPayloadCreator`, `Section`, `Store`, `StoreOptions`, `DebugOptions`,
@@ -35,9 +36,9 @@ The entry point also exports TypeScript contracts: `Name`, `Path`, `Updater`,
 
 The public `Store` contains `state`, `subscribers`, `sectionMap`, `pathRegistry`,
 `routingPlan`, `memo`, `pathBoundaryChars`, `serializer`, `deserializer`,
-`debugOptions`, `subscribe`, `hydrate`, and `save`. The symbol-keyed notification
-method is an internal integration point, exported from `src/createStore.ts` but
-not re-exported by the package entry point.
+`debugOptions`, `subscribe`, `hydrate`, `save`, and `purgeWhenUnused`. The
+symbol-keyed notification methods are internal integration points, exported from
+`src/createStore.ts` but not re-exported by the package entry point.
 
 `YasmPersistenceAdapter` requires `getItem`, `setItem`, and `removeItem`, each
 sync or async, and permits async/sync `clear`. `PersistConfig` additionally
@@ -57,9 +58,12 @@ supports `key`, `storage`, static/function `omitSections`, boolean/function
   capturing a call-time shallow copy of the state and registry.
 - `hydrationPromise`: single-flight promise reused by concurrent hydration calls.
 - `isHydrated`: blocks pre-hydration saves and autosave scheduling, then stays true.
+- `hydrationSuccess`: gates saves after a failed (quarantined) hydration so the
+  corrupted database is never overwritten with in-memory state in that session.
 - `executedMigrations`: in-memory migration IDs restored from and written to
   metadata; on an empty storage read, every configured migration is marked
   immediately because natively created state matches the current schema.
+- `pendingPurges`: deferred `purgeWhenUnused` schedules. Keys are removed when their last subscriber unsubscribes or when raw purge force-removes the record; an emptied entry re-verifies live subscribers at fire time before destroying. Re-scheduled entries replace previous ones for the same prefix/match. Pending entries are persisted in snapshot metadata and drained during hydration.
 
 The returned mutable structures are intentionally stateful:
 
@@ -133,6 +137,19 @@ logged, and never reject `hydrate()`/`save()`.
 - Dynamic omission is evaluated against the state captured at `save()` call
   time; custom callbacks run after built-in storage.
 - State updates and successful purge both invoke the external change callback.
+- `purgeWhenUnused` executes immediately with no subscribers, defers until
+  the last matching subscriber unsubscribes, re-verifies live subscribers at
+  fire time (revived paths with mounted readers are never wiped), and uses
+  segment-aware matching. Pending entries are persisted in
+  `metadata.pendingPurges`, and the next hydration drains them immediately
+  (nothing mounted) with the repair-save clearing the markers; immediate
+  purges leave no markers. Re-scheduling the same prefix replaces the
+  previous snapshot; `{ match: 'startsWith' }` is honored end-to-end;
+  fire-time detection is subscription-based, so a path recreated purely via
+  write-only hooks between scheduling and firing is wiped with the prefix
+  (documented caveat); a raw purge over a pending entry reconciles its
+  bookkeeping through the forced-unsubscribe notification instead of leaking
+  the marker into future snapshots.
 
 ### Option/default/invalid-combination scenarios
 
