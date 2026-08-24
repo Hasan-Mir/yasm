@@ -1,9 +1,16 @@
 # YASM API audit and test strategy
 
 This document is the API/state audit for the current package and the traceability
-matrix for the Node test suite. The repository uses `node:test` through `tsx`
-(`npm test`), with TypeScript checked by `npm run typecheck`; no Jest or Vitest
-runtime is present in `package.json`.
+matrix for the Node test suite. The repository uses two complementary runners:
+
+- **Core engine** (`tests/*.test.ts`): `node:test` through `tsx` (`npm test`) —
+  store, purge, persist, composition and util logic, no DOM required.
+- **React layer** (`tests/react/*.test.tsx`): Vitest + jsdom +
+  Testing Library (`npm run test:react`) — real mount/unmount so hook
+  reactivity (re-renders, subscription lifecycles, StrictMode, purges under
+  live components) is observed end to end.
+
+TypeScript is checked across both by `npm run typecheck`.
 
 ## 1. Public API audit
 
@@ -81,7 +88,10 @@ Updates resolve payload creators at dispatch time, use Immer for immutable
 replacement, notify `onStateChange`/persistence, and then invoke subscribers.
 Purge notifies only when actual state or registry data was removed. Hydration
 filters obsolete sections and paths, runs migrations before `onBeforeHydrate`,
-normalizes before merging, and writes a repaired snapshot when necessary. When
+normalizes before merging, writes a repaired snapshot when necessary, and
+notifies all live subscribers once after merging so components that mounted
+before hydration completed re-read their replaced state instead of showing
+lazy defaults forever. When
 any part of hydration fails, the corrupted raw data is quarantined: it is
 backed up under `<key>_corrupted_backup_<timestamp>` and the primary key is
 overwritten with a clean fresh snapshot. Hook and queue failures
@@ -119,6 +129,14 @@ logged, and never reject `hydrate()`/`save()`.
   (`selector` + `overrideInitialState`) and the context-bound
   `usePurgeYasmState` execute through `renderToString`; all subscribers of
   a path are notified; the memoized updater keeps its identity.
+- UI-level (jsdom) coverage: StrictMode double-mounting leaves exactly one
+  live subscription and double-effect `purgeWhenUnused` scheduling never
+  fires early; a reader mounted BEFORE hydration completes is notified once
+  hydration lands (and an `overrideInitialState` applied pre-hydration does
+  not survive the hydrated value); tab switching restores state from the
+  global store across full unmount/remount cycles and page refreshes;
+  a prefix purge waits for EVERY matching path to drain before wiping them
+  all; SSR output matches client-rendered DOM for the same store state.
 - Persistence lifecycle phases execute in the documented order
   (getItem → deserialize → migrations → onBeforeHydrate → repair-save →
   onHydrated); purged state does not resurrect after save + rehydration;
@@ -140,16 +158,21 @@ logged, and never reject `hydrate()`/`save()`.
 - `purgeWhenUnused` executes immediately with no subscribers, defers until
   the last matching subscriber unsubscribes, re-verifies live subscribers at
   fire time (revived paths with mounted readers are never wiped), and uses
-  segment-aware matching. Pending entries are persisted in
-  `metadata.pendingPurges`, and the next hydration drains them immediately
-  (nothing mounted) with the repair-save clearing the markers; immediate
-  purges leave no markers. Re-scheduling the same prefix replaces the
-  previous snapshot; `{ match: 'startsWith' }` is honored end-to-end;
-  fire-time detection is subscription-based, so a path recreated purely via
-  write-only hooks between scheduling and firing is wiped with the prefix
-  (documented caveat); a raw purge over a pending entry reconciles its
-  bookkeeping through the forced-unsubscribe notification instead of leaking
-  the marker into future snapshots.
+  segment-aware matching. The destructive pass runs on the NEXT task after
+  that last unsubscription and re-verifies again right before executing —
+  bridging React's synchronous detach/reattach flushes (StrictMode double
+  effects, concurrent transitions) where subscriptions transiently drop to
+  zero; if subscribers returned in the meantime the entry re-arms itself.
+  Bookkeeping (the pending marker) is still settled synchronously. Pending
+  entries are persisted in `metadata.pendingPurges`, and the next hydration
+  drains them immediately (nothing mounted) with the repair-save clearing
+  the markers; immediate purges leave no markers. Re-scheduling the same
+  prefix replaces the previous snapshot; `{ match: 'startsWith' }` is
+  honored end-to-end; fire-time detection is subscription-based, so a path
+  recreated purely via write-only hooks between scheduling and firing is
+  wiped with the prefix (documented caveat); a raw purge over a pending
+  entry reconciles its bookkeeping through the forced-unsubscribe
+  notification instead of leaking the marker into future snapshots.
 
 ### Option/default/invalid-combination scenarios
 

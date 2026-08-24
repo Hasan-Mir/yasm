@@ -520,6 +520,9 @@ const purgeWhenUnused = usePurgeWhenUnused();
 // with no queue, no setTimeout, and no app-level orchestration:
 purgeWhenUnused('/tabs/12');
 
+// Several subtrees at once — each prefix is scheduled independently:
+purgeWhenUnused(['/tabs/12', '/dialogs/42', '/drafts/7']);
+
 // A dialog that must forget its state on close — fires once the dialog's
 // children unsubscribe (after the close animation):
 purgeWhenUnused(`${dialogPath}`);
@@ -708,7 +711,11 @@ export const StoreProvider = ({ children }: { children: ReactNode }) => {
 
 > ⚠️ **Race Condition Warning**
 > Call `store.hydrate()` **once** during application startup **and before mounting any component that calls `useYasmState`**.
-> If a component initializes a path before `hydrate()` finishes, the path is created with the current `initialState`. When the persisted data later arrives, it is shallow-merged, which can produce surprising results or overwrite user actions that happened in the meantime.
+> Mounting consumers first will not lose data anymore — when hydration lands, a notification pass pushes the merged persisted values into every mounted component — but it still has downsides: components flash the default `initialState` and then re-render, an `overrideInitialState` applied pre-hydration is discarded in favor of persisted data, and updates dispatched before hydration cannot trigger autosave.
+> In development YASM logs a one-time `console.warn` the first time a hook initializes state on a store whose hydration is still pending (or failed), so misconfigurations surface immediately.
+>
+> You can also gate rendering programmatically with `store.isHydrated()` — it returns `true` once hydration finished, or right away when no persistence is configured.
+>
 > `hydrate()` always resolves (even on failure). If the stored snapshot is corrupted, YASM backs it up to a quarantine key and starts fresh — see **Corrupted Snapshot Handling** below.
 
 ### LocalForage / IndexedDB Adapter
@@ -1165,15 +1172,16 @@ const useValueState = <T>(path: string, initial: T) => {
 | Export                                            | Kind     | Description                                                                                                                           |
 | :------------------------------------------------ | :------- | :------------------------------------------------------------------------------------------------------------------------------------ |
 | `createStore(sectionMap, options?)`               | function | Creates the store. Options include debugging, persistence, path boundaries, serialization, and `onStateChange`.                       |
-| `store.hydrate()`                                 | method   | Loads and merges state + path registry from the configured persistence adapter. Must be awaited before mounting consumers.            |
-| `store.save()`                                    | method   | Immediately saves through built-in and/or custom persistence.                                                                         |
-| `store.purgeWhenUnused(pathPrefix, options?)`     | method   | Lifecycle-safe purge: executes when the last matching subscriber leaves (or immediately if none); persisted and drained on hydration. |
-| `YasmContext`                                     | context  | Provide the store to your tree.                                                                                                       |
-| `useYasmState(name, path, selectorOrOptions?)`    | hook     | Returns `[state, updater]`. Options: `selector`, `overrideInitialState`.                                                              |
-| `useYasmStateUpdater(name, path)`                 | hook     | Write-only access: returns just the updater; never subscribes or re-renders.                                                          |
-| `usePurgeYasmState()`                             | hook     | Returns `purge(pathPrefix, options?)`.                                                                                                |
-| `usePurgeWhenUnused()`                            | hook     | Lifecycle-safe purge: fires when the last matching subscriber leaves (or immediately if none).                                        |
-| `purgeYasmState(store, pathPrefix, options?)`     | function | Pure purge — usable outside React.                                                                                                    |
+| `store.hydrate()`                                 | method   | Loads and merges state + path registry from the configured persistence adapter. Await it before mounting consumers (see the hydration chapter). |
+| `store.isHydrated()`                              | method   | `true` once hydration finished — or immediately when no persistence is configured. Use it to gate rendering.                                    |
+| `store.save()`                                    | method   | Immediately saves through built-in and/or custom persistence.                                                                                  |
+| `store.purgeWhenUnused(path, options?)`           | method   | Lifecycle-safe purge: executes when the last matching subscriber leaves (or immediately if none); persisted and drained on hydration. `path` is a prefix or an array of prefixes. |
+| `YasmContext`                                     | context  | Provide the store to your tree.                                                                                                                |
+| `useYasmState(name, path, selectorOrOptions?)`    | hook     | Returns `[state, updater]`. Options: `selector`, `overrideInitialState`.                                                                       |
+| `useYasmStateUpdater(name, path)`                 | hook     | Write-only access: returns just the updater; never subscribes or re-renders.                                                                   |
+| `usePurgeYasmState()`                             | hook     | Returns `purge(pathPrefix \| pathPrefix[], options?)`.                                                                                          |
+| `usePurgeWhenUnused()`                            | hook     | Lifecycle-safe purge: fires when the last matching subscriber leaves (or immediately if none). Accepts one prefix or an array of prefixes.       |
+| `purgeYasmState(store, path, options?)`           | function | Pure purge — usable outside React. `path` is a prefix or an array of prefixes.                                                                  |
 | `arraySectionGenerator(childName, childSection)`  | function | Ordered map of child states with routing.                                                                                             |
 | `objectSectionGenerator(map)`                     | function | Named composition of child sections with routing.                                                                                     |
 | `mergeUpdaterGenerator<S>()`                      | function | `Partial<S>` shallow-merge updater.                                                                                                   |
