@@ -526,6 +526,22 @@ type Store<SM extends Record<Name, Section> = Record<Name, Section>> = {
     save: () => Promise<void>;
 
     /**
+     * Whether the store is ready for consumers:
+     *
+     * - `true` when hydration finished (or succeeded after a recovery), or
+     *   when no persistence is configured at all (nothing to wait for).
+     * - `false` while `hydrate()` is still in flight or failed/quarantined.
+     *
+     * Useful for gating rendering (`store.isHydrated() ? children : null`)
+     * and for diagnostics. YASM also warns once per store, in development,
+     * when a hook initializes a state before hydration finished — see
+     * `hydrate()` for why mounting consumers first is discouraged (though
+     * no longer data-loss-prone: merged persisted values are pushed into
+     * mounted components by a post-hydration notification pass).
+     */
+    isHydrated: () => boolean;
+
+    /**
      * Lifecycle-safe purge: schedules the destruction of every path matching
      * `pathPrefix` for the moment its last subscriber unsubscribes — or
      * executes it immediately when nothing is subscribed at call time.
@@ -533,16 +549,24 @@ type Store<SM extends Record<Name, Section> = Record<Name, Section>> = {
      * Unlike raw `purgeYasmState`, this never races React's asynchronous
      * unmounting, never warns, and re-verifies live subscribers at fire time
      * so revived or newly created paths (with mounted readers) under the
-     * prefix are never wiped. ⚠️ Detection is subscription-based: a path
-     * recreated between scheduling and firing purely through write-only
-     * hooks (`useYasmStateUpdater`, which never subscribes) is invisible to
-     * the re-verification and is destroyed with the rest of the prefix.
-     * Unmounting alone never purges — the decision always stays with the
-     * caller. Pending purges are persisted in snapshot metadata and
-     * re-scheduled (executed immediately, since consumers are not mounted
-     * yet) during the next hydration.
+     * prefix are never wiped. Once the last matching subscriber leaves, the
+     * destruction runs on the NEXT task (not inline), and live subscribers
+     * are re-verified again right before executing — this bridges React's
+     * synchronous detach/reattach windows such as StrictMode's double effect
+     * invocation, where subscriptions transiently drop to zero mid-flush.
+     *
+     * ⚠️ Detection is subscription-based: a path recreated between scheduling
+     * and firing purely through write-only hooks (`useYasmStateUpdater`,
+     * which never subscribes) is invisible to the re-verification and is
+     * destroyed with the rest of the prefix. Unmounting alone never purges —
+     * the decision always stays with the caller. Pending purges are persisted
+     * in snapshot metadata and re-scheduled (executed immediately, since
+     * consumers are not mounted yet) during the next hydration.
      */
-    purgeWhenUnused: (pathPrefix: string, options?: PurgeOptions) => void;
+    purgeWhenUnused: (
+        pathPrefix: string | string[],
+        options?: PurgeOptions
+    ) => void;
 
     /**
      * Internal method used to trigger change listeners and persistence mechanisms
@@ -690,12 +714,37 @@ const createStore = <SM extends Record<Name, Section>>(
             return;
         }
 
+        // Bookkeeping is settled synchronously so snapshots taken right after
+        // the last unsubscribe no longer carry the marker…
         pendingPurges = pendingPurges.filter(pending => pending !== entry);
-        purgeYasmState(
-            store,
-            entry.pathPrefix,
-            entry.match === 'startsWith' ? { match: 'startsWith' } : undefined
-        );
+
+        // …but the destruction itself is deferred to the next task and
+        // re-verified at execution time. React can detach and re-attach a
+        // subtree within one synchronous flush (StrictMode's double effect
+        // invocation, concurrent transitions), momentarily dropping every
+        // subscription — firing inline here would wipe state for components
+        // that are about to remount. Waiting one task bridges those gaps;
+        // if subscribers came back in the meantime, the entry re-arms itself.
+        setTimeout(() => {
+            const liveKeysAtFire = collectSubscribedKeys(
+                entry.pathPrefix,
+                entry.match
+            );
+
+            if (liveKeysAtFire.size > 0) {
+                entry.pendingKeys = liveKeysAtFire;
+                pendingPurges.push(entry);
+                return;
+            }
+
+            purgeYasmState(
+                store,
+                entry.pathPrefix,
+                entry.match === 'startsWith'
+                    ? { match: 'startsWith' }
+                    : undefined
+            );
+        }, 0);
     };
 
     const handleLastSubscriberLeft = (
@@ -715,6 +764,38 @@ const createStore = <SM extends Record<Name, Section>>(
             entry.pendingKeys.delete(key);
             if (entry.pendingKeys.size === 0) {
                 firePendingPurge(store, entry);
+            }
+        }
+    };
+
+    // 🔔 Notifies every live (section, path) subscriber once. Used after
+    // hydration merges persisted data over the store: components that
+    // mounted BEFORE `hydrate()` resolved are lazily initialized with the
+    // default state, and React's `useSyncExternalStore` has no way to know
+    // the snapshot behind it was replaced — without this ping those
+    // components keep rendering stale defaults until an unrelated update.
+    // Callbacks only trigger re-reads (`getState`), never writes, so a
+    // snapshot copy of the records is enough to stay safe against
+    // synchronous unsubscriptions mid-loop.
+    const notifyAllSubscribers = () => {
+        for (const name of Object.keys(subscribers)) {
+            const sectionSubscribers = (
+                subscribers as Record<
+                    string,
+                    Record<Path, Record<number, () => void>>
+                >
+            )[name];
+            if (sectionSubscribers === undefined) {
+                continue;
+            }
+            for (const path of Object.keys(sectionSubscribers)) {
+                const record = sectionSubscribers[path];
+                if (record === undefined) {
+                    continue;
+                }
+                for (const id of Object.keys(record)) {
+                    record[id as unknown as number]?.();
+                }
             }
         }
     };
@@ -948,9 +1029,23 @@ const createStore = <SM extends Record<Name, Section>>(
         /**
          * Lifecycle-safe purge — see the `Store` type docs. Fires when the
          * last matching subscriber leaves (or immediately when unused).
+         * Accepts a single prefix or an array of prefixes (each scheduled
+         * independently).
          */
-        purgeWhenUnused(pathPrefix: string, options?: PurgeOptions) {
-            schedulePurgeWhenUnused(this, pathPrefix, options?.match);
+        purgeWhenUnused(pathPrefix: string | string[], options?: PurgeOptions) {
+            const prefixes = Array.isArray(pathPrefix)
+                ? pathPrefix
+                : [pathPrefix];
+
+            for (const prefix of prefixes) {
+                schedulePurgeWhenUnused(this, prefix, options?.match);
+            }
+        },
+
+        isHydrated() {
+            // A store without persistence has nothing to wait for — it is
+            // always "hydrated" from a consumer's point of view.
+            return isHydrated || options?.persist === undefined;
         },
 
         hydrate() {
@@ -1287,6 +1382,12 @@ const createStore = <SM extends Record<Name, Section>>(
                                 // pending markers) through the repair-save.
                                 isStateChangedDuringHydration = true;
                             }
+
+                            // 8. Wake up any subscriber that mounted before
+                            // hydration finished so it re-reads its (possibly
+                            // replaced) state instead of showing the lazy
+                            // default forever.
+                            notifyAllSubscribers();
                         }
                     } else if (p.migrations) {
                         // 🛡️ Fresh install (empty storage): natively created

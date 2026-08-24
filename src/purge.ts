@@ -24,12 +24,27 @@ type PurgeOptions = {
  * Removes every state, subscriber record, memoized hook plumbing and path
  * registration whose path matches `pathPrefix`.
  *
+ * Accepts a single prefix or an array of prefixes (each is processed
+ * independently, in order).
+ *
  * This is a pure (non-hook) function so it can be called from anywhere:
  * event handlers, effects, timeouts, or tests. Inside React components you
  * can use the `usePurgeYasmState` hook, which simply binds this function to
  * the store in context.
  */
 const purgeYasmState = <SM extends Record<Name, Section>>(
+    store: Store<SM>,
+    pathPrefix: string | string[],
+    options?: PurgeOptions
+): void => {
+    const prefixes = Array.isArray(pathPrefix) ? pathPrefix : [pathPrefix];
+
+    for (const prefix of prefixes) {
+        purgePathsWithinPrefix(store, prefix, options);
+    }
+};
+
+const purgePathsWithinPrefix = <SM extends Record<Name, Section>>(
     store: Store<SM>,
     pathPrefix: string,
     options?: PurgeOptions

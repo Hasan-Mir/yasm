@@ -17,7 +17,7 @@ const usePurgeYasmState = () => {
     }
 
     return useCallback(
-        (pathPrefix: string, options?: PurgeOptions) =>
+        (pathPrefix: string | string[], options?: PurgeOptions) =>
             purgeYasmState(store, pathPrefix, options),
         [store]
     );

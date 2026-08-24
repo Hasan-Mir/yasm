@@ -7,6 +7,12 @@ import { counterSection, captureWarnings } from './helpers';
 
 const makeStore = () => createStore({ Counter: counterSection });
 
+// Deferred `purgeWhenUnused` fires on the next macrotask after the last
+// unsubscribe (so React's synchronous detach/reattach flushes — StrictMode
+// double effects — cannot lose state in between). Tests await one tick to
+// let the destructive pass execute.
+const tick = () => new Promise(resolve => setTimeout(resolve, 0));
+
 test('segment matching: purging "/tabs/1" does NOT purge "/tabs/10"', () => {
     const store = makeStore();
     init(store, 'Counter', '/tabs/1');
@@ -137,13 +143,14 @@ test('purgeWhenUnused defers until the last matching subscriber leaves', async (
     );
 
     unsubscribeSecond();
+    await tick();
     assert.equal(store.state.Counter['/t/1'], undefined);
     assert.equal(store.state.Counter['/t/2'], undefined);
     assert.equal(store.memo.Counter['/t/1'], undefined);
     assert.equal(store.memo.Counter['/t/2'], undefined);
 });
 
-test('purgeWhenUnused never wipes revived paths (fire-time re-verification)', () => {
+test('purgeWhenUnused never wipes revived paths (fire-time re-verification)', async () => {
     const store = makeStore();
     init(store, 'Counter', '/t/1');
     init(store, 'Counter', '/t/2');
@@ -165,18 +172,20 @@ test('purgeWhenUnused never wipes revived paths (fire-time re-verification)', ()
     );
 
     unsubscribeSecond();
+    await tick();
     // The fire attempt re-verified against live subscribers, found the
     // revived /t/1, and keeps waiting instead of wiping it
     assert.notEqual(store.state.Counter['/t/1'], undefined);
     assert.notEqual(store.state.Counter['/t/2'], undefined);
 
     unsubscribeRevived();
+    await tick();
     // Now genuinely unused — the whole prefix is destroyed
     assert.equal(store.state.Counter['/t/1'], undefined);
     assert.equal(store.state.Counter['/t/2'], undefined);
 });
 
-test('purgeWhenUnused re-scheduling replaces the previous snapshot (dedup)', () => {
+test('purgeWhenUnused re-scheduling replaces the previous snapshot (dedup)', async () => {
     const store = makeStore();
     init(store, 'Counter', '/t/1');
     const unsubscribeFirst = store.memo.Counter['/t/1'].subscribe(
@@ -194,15 +203,17 @@ test('purgeWhenUnused re-scheduling replaces the previous snapshot (dedup)', () 
     store.purgeWhenUnused('/t');
 
     unsubscribeFirst();
+    await tick();
     // Stale bookkeeping would fire here and wipe /t/2; the fresh snapshot
     // (and the fire-time re-verification) keeps waiting instead.
     assert.notEqual(store.state.Counter['/t/2'], undefined);
 
     unsubscribeSecond();
+    await tick();
     assert.equal(store.state.Counter['/t/2'], undefined);
 });
 
-test('purgeWhenUnused supports legacy { match: "startsWith" }', () => {
+test('purgeWhenUnused supports legacy { match: "startsWith" }', async () => {
     const store = makeStore();
     init(store, 'Counter', '/t/1');
     init(store, 'Counter', '/t/10');
@@ -217,12 +228,13 @@ test('purgeWhenUnused supports legacy { match: "startsWith" }', () => {
     assert.notEqual(store.state.Counter['/t/10'], undefined);
 
     unsubscribeTen();
+    await tick();
     // The deferred fire wipes both paths, exactly like a raw startsWith purge.
     assert.equal(store.state.Counter['/t/1'], undefined);
     assert.equal(store.state.Counter['/t/10'], undefined);
 });
 
-test('purgeWhenUnused fire-time re-verification tracks subscriptions, not bare state', () => {
+test('purgeWhenUnused fire-time re-verification tracks subscriptions, not bare state', async () => {
     const store = makeStore();
     init(store, 'Counter', '/t/1');
     const unsubscribe = store.memo.Counter['/t/1'].subscribe(() => undefined);
@@ -233,6 +245,7 @@ test('purgeWhenUnused fire-time re-verification tracks subscriptions, not bare s
     init(store, 'Counter', '/t/2');
 
     unsubscribe();
+    await tick();
     // Only /t/1 was tracked; the fire wipes the whole prefix including the
     // freshly initialized-but-unsubscribed /t/2 (documented caveat).
     assert.equal(store.state.Counter['/t/2'], undefined);
@@ -254,4 +267,54 @@ test('purgeWhenUnused uses segment-aware matching like raw purge', () => {
     assert.notEqual(store.state.Counter['/t/10'], undefined);
 
     unsubscribeTen();
+});
+
+test('purgeYasmState accepts an array of prefixes', () => {
+    const store = makeStore();
+    init(store, 'Counter', '/tabs/1');
+    init(store, 'Counter', '/tabs/1/child');
+    init(store, 'Counter', '/dialogs/42');
+    init(store, 'Counter', '/keep/me');
+
+    purgeYasmState(store, ['/tabs/1', '/dialogs/42']);
+
+    assert.equal(store.state.Counter['/tabs/1'], undefined);
+    assert.equal(store.state.Counter['/tabs/1/child'], undefined);
+    assert.equal(store.state.Counter['/dialogs/42'], undefined);
+    // Untouched prefix survives
+    assert.notEqual(store.state.Counter['/keep/me'], undefined);
+
+    // Memo records are cleaned for all purged prefixes too
+    assert.equal(store.memo.Counter['/tabs/1'], undefined);
+    assert.equal(store.memo.Counter['/tabs/1/child'], undefined);
+    assert.equal(store.memo.Counter['/dialogs/42'], undefined);
+});
+
+test('purgeWhenUnused accepts an array of prefixes', async () => {
+    const store = makeStore();
+    init(store, 'Counter', '/a/1');
+    init(store, 'Counter', '/b/2');
+    init(store, 'Counter', '/c/3');
+
+    const unsubscribeA = store.memo.Counter['/a/1'].subscribe(() => undefined);
+    const unsubscribeB = store.memo.Counter['/b/2'].subscribe(() => undefined);
+
+    // Both prefixes pend together while their readers are mounted
+    store.purgeWhenUnused(['/a/1', '/b/2']);
+    assert.notEqual(store.state.Counter['/a/1'], undefined);
+    assert.notEqual(store.state.Counter['/b/2'], undefined);
+
+    unsubscribeA();
+    await tick();
+    // /b/2 still holds its own schedule; /a/1 fired independently
+    assert.equal(store.state.Counter['/a/1'], undefined);
+    assert.notEqual(store.state.Counter['/b/2'], undefined);
+
+    unsubscribeB();
+    await tick();
+    assert.equal(store.state.Counter['/b/2'], undefined);
+
+    // A never-subscribed path in an array purges immediately at schedule time
+    store.purgeWhenUnused(['/nonexistent', '/c/3']);
+    assert.equal(store.state.Counter['/c/3'], undefined);
 });

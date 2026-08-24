@@ -10,6 +10,10 @@ import {
     SYMBOL_NOTIFY_CHANGE
 } from './createStore';
 
+// Dev-only diagnostics: warn ONCE per store when a hook initializes state
+// before persistence hydration has finished (see `init`).
+const warnedNotHydratedStores = new WeakSet<object>();
+
 /**
  * Overrides applied on top of `initialState` when a path is initialized:
  * either an object merged over the initial state, or a callback receiving
@@ -189,6 +193,31 @@ const init = <SM extends Record<Name, Section>, N extends keyof SM>(
     const existingRecord = memo[path];
     if (existingRecord !== undefined) {
         return existingRecord;
+    }
+
+    // 🛡️ Dev-time diagnostics: a hook ran while persistence hydration was
+    // still in flight. This is SAFE (a post-hydration notification pass
+    // pushes merged values into mounted components), but it means the
+    // component first renders default state, `overrideInitialState` is
+    // clobbered by persisted data, and an extra render happens. Gating the
+    // tree on `store.isHydrated()` avoids all of that. Warn once per store.
+    if (
+        process.env.NODE_ENV !== 'production' &&
+        !warnedNotHydratedStores.has(store) &&
+        !store.isHydrated()
+    ) {
+        warnedNotHydratedStores.add(store);
+        console.warn(
+            [
+                'YASM [Warning]: a hook initialized state BEFORE store.hydrate() finished.',
+                'This works (persisted values are merged into mounted components when hydration lands), but:',
+                '  1. the component first renders the default initialState, then re-renders with hydrated data,',
+                '  2. overrideInitialState applied now is discarded in favor of persisted data,',
+                '  3. updates dispatched before hydration cannot trigger autosave.',
+                'Prefer gating your tree on hydration: await store.hydrate() and render children only afterwards',
+                '(store.isHydrated() tells you when it is safe).'
+            ].join('\n')
+        );
     }
 
     const state = store.state as Record<Name, Record<Path, any>>;

@@ -10,10 +10,15 @@ import { PurgeOptions } from './purge';
  * The scheduled purge executes after the last subscriber of every matching
  * path unsubscribes (or immediately when nothing is subscribed at call
  * time), re-verifying live subscribers at fire time so revived paths with
- * mounted readers are never wiped. ⚠️ Detection is subscription-based: a
- * path recreated purely through write-only hooks (`useYasmStateUpdater`)
- * between scheduling and firing is invisible to the re-verification.
- * Pending purges are persisted and re-scheduled on the next hydration.
+ * mounted readers are never wiped. The destructive pass runs on the next
+ * task after that last unsubscription (with a second live-subscriber check),
+ * so React flushes that synchronously detach/reattach subtrees — StrictMode
+ * double effects, concurrent transitions — cannot lose state in between.
+ *
+ * ⚠️ Detection is subscription-based: a path recreated purely through
+ * write-only hooks (`useYasmStateUpdater`) between scheduling and firing is
+ * invisible to the re-verification. Pending purges are persisted and
+ * re-scheduled on the next hydration.
  * See `Store['purgeWhenUnused']` and the README's purging chapter for the
  * full contract.
  */
@@ -27,7 +32,7 @@ const usePurgeWhenUnused = () => {
     }
 
     return useCallback(
-        (pathPrefix: string, options?: PurgeOptions) =>
+        (pathPrefix: string | string[], options?: PurgeOptions) =>
             store.purgeWhenUnused(pathPrefix, options),
         [store]
     );
