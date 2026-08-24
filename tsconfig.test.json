@@ -3,7 +3,8 @@
     "compilerOptions": {
         "composite": false,
         "noEmit": true,
-        "types": ["node"],
+        "jsx": "react-jsx",
+        "types": ["node", "vitest/globals"],
         "rootDir": "."
     },
     "include": ["src", "tests"],
