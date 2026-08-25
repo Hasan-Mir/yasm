@@ -329,14 +329,14 @@ const init = <SM extends Record<Name, Section>, N extends keyof SM>(
                 console.debug(
                     `%cYASM (Filtered)%c updating "${String(routedName)}" at path "${routedPath}"`,
                     'background: #0d9488; color: white; padding: 2px 6px; border-radius: 4px; font-weight: bold;',
-                    'color: inherit;',
-                    resolvedPayload
+                    'color: inherit;'
                 );
+                console.debug(resolvedPayload);
             } else {
                 console.debug(
-                    `YASM: updating "${String(routedName)}" at path "${routedPath}"`,
-                    resolvedPayload
+                    `YASM: updating "${String(routedName)}" at path "${routedPath}"`
                 );
+                console.debug(resolvedPayload);
             }
 
             console.debug('before:');
