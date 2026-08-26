@@ -1,5 +1,12 @@
 import { Immer } from 'immer';
-import { Name, Section, StoreOptions, Updater } from './createStore';
+import {
+    Name,
+    Path,
+    Section,
+    Store,
+    StoreOptions,
+    Updater
+} from './createStore';
 
 const immer = new Immer();
 
@@ -586,6 +593,31 @@ function postDecode(value: unknown): unknown {
 }
 
 /**
+ * Round-trips `obj` through the store's serializer/deserializer (preserving
+ * `undefined` values via a placeholder) so the returned copy matches what
+ * persistence would store. Pure — no console output.
+ */
+const serializeForSnapshot = <T>(
+    obj: T,
+    storeOptions: StoreOptions<any>
+): T => {
+    const encoded = preEncode(obj);
+
+    const json = JSON.stringify(encoded, function (key, value) {
+        return storeOptions.serializer
+            ? storeOptions.serializer(
+                  this as Record<string, unknown>,
+                  key,
+                  value
+              )
+            : value;
+    });
+
+    const parsed = JSON.parse(json, storeOptions.deserializer);
+    return postDecode(parsed) as T;
+};
+
+/**
  * Logs a debug snapshot of `obj` to the console, round-tripping it through
  * the store's serializer/deserializer and preserving `undefined` values (via
  * a placeholder) so the logged copy matches what persistence would store.
@@ -594,18 +626,489 @@ const snapshot = (
     obj: Record<string, unknown>,
     storeOptions: StoreOptions<any>
 ) => {
-    const encoded = preEncode(obj);
+    console.debug(serializeForSnapshot(obj, storeOptions));
+};
 
-    const json = JSON.stringify(encoded, function (key, value) {
-        return storeOptions.serializer
-            ? storeOptions.serializer(this, key, value)
-            : value;
-    });
+/**
+ * Builds a scoped debug/introspection snapshot containing the state entries
+ * whose path matches `pathPrefix` (segment-aware by default). Overloaded for
+ * every call shape:
+ *
+ * - `snapshotByPrefix(store, pathPrefix, options?)` — one subtree (or an
+ *   array of subtrees).
+ * - `snapshotByPrefix(store, options?)` — the ENTIRE store.
+ *
+ * This is the imperative primitive behind `debugOptions.snapshotFilter`:
+ * it never logs by itself — pass the result to `console.debug`, stringify it,
+ * diff two calls around an update, or assert on it in tests.
+ *
+ * Matching uses the same `isPathWithinPrefix` semantics as purge (including
+ * custom `pathBoundaryChars`), so `/tabs/1` can never accidentally match
+ * `/tabs/10`. An empty prefix matches everything.
+ *
+ * @example
+ * snapshotByPrefix(store, '/tabs/12');                    // flat subtree
+ * snapshotByPrefix(store, '/tabs/12', { mode: 'tree' });  // nested subtree
+ * snapshotByPrefix(store, ['/a', '/b']);                  // several subtrees
+ * snapshotByPrefix(store);                                // ENTIRE store, flat
+ * snapshotByPrefix(store, { mode: 'tree' });              // ENTIRE store as tree
+ */
+function snapshotByPrefix<SM extends Record<Name, Section>>(
+    store: Store<SM>,
+    pathPrefix: string | string[],
+    options?: SnapshotByPrefixOptions
+): Record<string, any>;
+function snapshotByPrefix<SM extends Record<Name, Section>>(
+    store: Store<SM>,
+    options?: SnapshotByPrefixOptions
+): Record<string, any>;
+function snapshotByPrefix<SM extends Record<Name, Section>>(
+    store: Store<SM>,
+    pathPrefixOrOptions?: string | string[] | SnapshotByPrefixOptions,
+    maybeOptions?: SnapshotByPrefixOptions
+): Record<string, any> {
+    const hasExplicitPrefix =
+        typeof pathPrefixOrOptions === 'string' ||
+        Array.isArray(pathPrefixOrOptions);
 
-    const parsed = JSON.parse(json, storeOptions.deserializer);
-    const restored = postDecode(parsed);
+    const prefixesInput: string | string[] = hasExplicitPrefix
+        ? (pathPrefixOrOptions as string | string[])
+        : '';
 
-    console.debug(restored);
+    const options: SnapshotByPrefixOptions | undefined =
+        !hasExplicitPrefix && pathPrefixOrOptions !== undefined
+            ? (pathPrefixOrOptions as SnapshotByPrefixOptions)
+            : maybeOptions;
+
+    const mode = options?.mode ?? 'flat';
+    const match = options?.match ?? 'segment';
+    const shouldSerialize = options?.serialize ?? true;
+    const boundaryChars = store.pathBoundaryChars;
+
+    const sectionFilters =
+        options?.sectionFilter === undefined
+            ? undefined
+            : Array.isArray(options.sectionFilter)
+              ? options.sectionFilter
+              : [options.sectionFilter];
+
+    const prefixes = Array.isArray(prefixesInput)
+        ? prefixesInput
+        : [prefixesInput];
+
+    const matches = (path: string) =>
+        prefixes.some(prefix =>
+            match === 'startsWith'
+                ? path.startsWith(prefix)
+                : match === 'exact'
+                  ? path === prefix
+                  : isPathWithinPrefix(path, prefix, boundaryChars)
+        );
+
+    type Entry = { section: Name; path: Path; value: unknown };
+    const entries: Entry[] = [];
+
+    for (const sectionKey of Object.keys(store.state) as Name[]) {
+        if (
+            sectionFilters !== undefined &&
+            !sectionFilters.includes(sectionKey)
+        ) {
+            continue;
+        }
+
+        const sectionState = store.state[sectionKey];
+        if (sectionState === undefined) {
+            continue;
+        }
+        for (const path of Object.keys(sectionState)) {
+            if (!matches(path)) {
+                continue;
+            }
+            entries.push({
+                section: sectionKey,
+                path,
+                value: shouldSerialize
+                    ? serializeForSnapshot(sectionState[path], store)
+                    : sectionState[path]
+            });
+        }
+    }
+
+    if (mode === 'flat') {
+        const result: Record<string, Record<string, unknown>> = {};
+        for (const entry of entries) {
+            const sectionBucket = (result[entry.section as string] ??= {});
+            sectionBucket[entry.path] = entry.value;
+        }
+        return result;
+    }
+
+    // ---- tree mode -------------------------------------------------------
+    // Group by physical path first: multiple sections may own the exact same
+    // path (routed/composed setups). Then nest each path under its CLOSEST
+    // collected ancestor (longest matching proper prefix), processing paths
+    // shortest-first so parents are always created before their children.
+    const sectionsByPath = new Map<string, Record<string, unknown>>();
+    for (const entry of entries) {
+        let bucket = sectionsByPath.get(entry.path);
+        if (bucket === undefined) {
+            bucket = {};
+            sectionsByPath.set(entry.path, bucket);
+        }
+        bucket[entry.section as string] = entry.value;
+    }
+
+    type TreeNode = {
+        __state__: Record<string, unknown>;
+        __children__: Record<string, unknown>;
+        __subscribers__?: number;
+    };
+
+    const nodes = new Map<string, TreeNode>();
+    const nodeFor = (path: string): TreeNode => {
+        let node = nodes.get(path);
+        if (node === undefined) {
+            node = { __state__: {}, __children__: {} };
+            nodes.set(path, node);
+        }
+        return node;
+    };
+
+    const subscriberCount = (path: string): number => {
+        let count = 0;
+        for (const sectionName of Object.keys(sectionsByPath.get(path) ?? {})) {
+            const record = (store.subscribers as any)[sectionName]?.[path];
+            if (record !== undefined) {
+                count += Object.keys(record).length;
+            }
+        }
+        return count;
+    };
+
+    const tree: Record<string, unknown> = {};
+
+    const sortedPaths = Array.from(sectionsByPath.keys()).sort(
+        (a, b) => a.length - b.length
+    );
+    for (const path of sortedPaths) {
+        const node = nodeFor(path);
+        node.__state__ = sectionsByPath.get(path)!;
+        if (options?.includeSubscribers === true) {
+            node.__subscribers__ = subscriberCount(path);
+        }
+
+        // Closest collected ancestor = longest other path that is a valid
+        // segment-aware proper prefix of this one. Paths were inserted
+        // shortest-first, so every candidate already exists in `nodes`.
+        let closestAncestor: TreeNode | undefined;
+        let ancestorLength = 0;
+        for (const [candidatePath, candidateNode] of Array.from(nodes)) {
+            if (
+                candidatePath !== path &&
+                candidatePath.length > ancestorLength &&
+                candidatePath.length < path.length &&
+                isPathWithinPrefix(path, candidatePath, boundaryChars)
+            ) {
+                closestAncestor = candidateNode;
+                ancestorLength = candidatePath.length;
+            }
+        }
+
+        if (closestAncestor !== undefined) {
+            closestAncestor.__children__[path] = node;
+        } else {
+            tree[path] = node;
+        }
+    }
+
+    return tree;
+}
+
+type MemoryStorage = {
+    getItem: (key: string) => Promise<string | null>;
+    setItem: (key: string, value: string) => Promise<void>;
+    removeItem: (key: string) => Promise<void>;
+    clear: () => Promise<void>;
+    /** Direct access for test assertions. */
+    readonly data: Map<string, string>;
+};
+
+/**
+ * Creates an in-memory `YasmPersistenceAdapter` for tests, stories and SSR —
+ * the same shape `createStore({ persist: { storage } })` expects. Removes the
+ * need to hand-roll a mock storage in every persistence test.
+ *
+ * @example
+ * const storage = createMemoryStorage();
+ * const store = createStore(APP_SECTIONS, {
+ *     persist: { key: 'test-state', storage }
+ * });
+ *
+ * // Assert directly on the backing Map in tests:
+ * await store.save();
+ * assert.ok(storage.data.get('test-state'));
+ */
+const createMemoryStorage = (): MemoryStorage => {
+    const data = new Map<string, string>();
+    return {
+        getItem: async key => data.get(key) ?? null,
+        setItem: async (key, value) => {
+            data.set(key, value);
+        },
+        removeItem: async key => {
+            data.delete(key);
+        },
+        clear: async () => {
+            data.clear();
+        },
+        data
+    };
+};
+
+const padNumber = (value: number, length = 2): string =>
+    String(value).padStart(length, '0');
+
+/** Default dimmed dev-log timestamp: local `HH:MM:SS.mmm`. */
+const DEFAULT_DEBUG_TIMESTAMP_FORMAT = (date: Date): string =>
+    `${padNumber(date.getHours())}:${padNumber(date.getMinutes())}:${padNumber(
+        date.getSeconds()
+    )}.${padNumber(date.getMilliseconds(), 3)}`;
+
+/** A styled/unstyled text segment of a development log line. */
+type DebugLogPart = { text: string; style?: string };
+
+/** Dimmed gray used for the default dev-log timestamp. */
+const DEBUG_TIMESTAMP_STYLE = 'color: #6b7280;';
+
+/**
+ * Resolves the conditional dimmed-timestamp segment prefixed to development
+ * log lines (`YASM: updating…`, `🧹 YASM purging…`, `Before:`, `After:` …).
+ *
+ * Controlled by `debugOptions.timestampFormatter`:
+ * - `undefined` (default): dimmed local `HH:MM:SS.mmm`.
+ * - `(date) => string`: full control (e.g. `d => d.toLocaleTimeString()`).
+ * - `false`: disabled entirely (also when a custom formatter returns '').
+ *
+ * Internal helper — consumed by `composeDebugLogArgs`; do not spread its
+ * result into `console.debug(...)` directly or `%c` ordering can drift.
+ */
+const debugTimestampPart = (debugOptions: {
+    timestampFormatter?: ((date: Date) => string) | false;
+}): DebugLogPart | undefined => {
+    if (debugOptions.timestampFormatter === false) {
+        return undefined;
+    }
+    const date = new Date();
+    const text = debugOptions.timestampFormatter
+        ? debugOptions.timestampFormatter(date)
+        : DEFAULT_DEBUG_TIMESTAMP_FORMAT(date);
+    if (!text) {
+        return undefined;
+    }
+    return { text: `${text} `, style: DEBUG_TIMESTAMP_STYLE };
+};
+
+/**
+ * Legacy shape of the timestamp segment (`[`%c… `, style]`). Kept for
+ * backward compatibility with external imports — new code should go through
+ * `composeDebugLogArgs` / `debugTimestampPart`.
+ */
+const debugTimestampArgs = (store: {
+    debugOptions?: {
+        timestampFormatter?: ((date: Date) => string) | false;
+    };
+}): unknown[] => {
+    const part = debugTimestampPart(store.debugOptions ?? {});
+    return part ? [`%c${part.text}`, part.style] : [];
+};
+
+/** Matches a letter, number, or underscore (ASCII + Latin-1 supplement). */
+const LOG_WORD_CHAR = /[A-Za-z0-9_\u00C0-\u024F]/;
+
+/**
+ * Dev-only readability guard for development log lines: the text parts render
+ * ADJACENT to each other, so when one part ends with a word character and the
+ * next begins with one they mash together — e.g. `"YASM purging"` +
+ * `"paths matching…"` → `"purgingpaths"`. Warns once per offending seam with
+ * enough context to fix the call site.
+ */
+const warnAboutUnreadableLogSeams = (texts: string[]): void => {
+    if (process.env.NODE_ENV === 'production') {
+        return;
+    }
+
+    for (let i = 1; i < texts.length; i++) {
+        // ⚠️ Use the RAW boundary characters — a trailing/leading space at
+        // the seam IS the separator, so trimming here would flag healthy
+        // parts ("…purging " + "Filtered…" renders as "purging Filtered").
+        const prevEnd = texts[i - 1].slice(-1);
+        const nextStart = texts[i].slice(0, 1);
+
+        if (
+            prevEnd !== '' &&
+            nextStart !== '' &&
+            LOG_WORD_CHAR.test(prevEnd) &&
+            LOG_WORD_CHAR.test(nextStart)
+        ) {
+            console.warn(
+                `YASM [Warning]: dev-log parts "${texts[
+                    i - 1
+                ].trim()}" and "${texts[i].trim()}" render mashed together as "...${prevEnd}${nextStart}..." — add a separator space at that seam.`
+            );
+        }
+    }
+};
+
+/**
+ * Composes a full `console.debug` argument list for development logs,
+ * guaranteeing `%c`/style-argument parity:
+ *
+ * - a conditional dimmed timestamp segment (see `debugTimestampPart`);
+ * - one entry per styled/unstyled text part;
+ * - trailing raw values (payloads, path arrays…).
+ *
+ * Styled lines are emitted as ONE format string in which every `%c` is
+ * immediately followed by `%s` (`'%c%s %c%s …'` + interleaved style/text
+ * arguments) instead of adjacent bare `%c…` string arguments. Some console
+ * wrappers only honor the FIRST `%c` of adjacent bare `%c` arguments and
+ * print the remaining ones literally (raw `%c` markers + CSS in the output),
+ * while chained `%c`/`%s` specifiers inside a single format string render
+ * correctly everywhere.
+ *
+ * All dev-log call sites MUST go through this composer — hand-assembling
+ * `%c` arguments is how style counts drift out of sync and consoles end up
+ * printing literal `%c` and raw CSS.
+ */
+const composeDebugLogArgs = (
+    store: {
+        debugOptions?: {
+            timestampFormatter?: ((date: Date) => string) | false;
+            disableLogStyling?: boolean;
+        };
+    },
+    parts: DebugLogPart[],
+    ...tail: unknown[]
+): unknown[] => {
+    const debugOptions = store.debugOptions ?? {};
+
+    // Dev-only readability check — must run for BOTH output modes BEFORE any
+    // early return: the parts render adjacent in either mode, so a missing
+    // separator would silently produce e.g. "YASM purgingpaths".
+    if (process.env.NODE_ENV !== 'production') {
+        warnAboutUnreadableLogSeams([
+            debugTimestampPart(debugOptions)?.text ?? '',
+            ...parts.map(part => part.text)
+        ]);
+    }
+
+    // Plain mode (`disableLogStyling: true`): ONE pre-joined string, zero %c —
+    // safe in consoles that don't support chained %c styling (Node/SSR,
+    // vConsole/eruda, logger wrappers).
+    if (debugOptions.disableLogStyling === true) {
+        const date = new Date();
+        const ts =
+            debugOptions.timestampFormatter === false
+                ? ''
+                : debugOptions.timestampFormatter
+                  ? debugOptions.timestampFormatter(date)
+                  : DEFAULT_DEBUG_TIMESTAMP_FORMAT(date);
+        const line = `${ts ? `[${ts}] ` : ''}${parts
+            .map(part => part.text)
+            .join('')}`;
+        return tail.length > 0 ? [line, ...tail] : [line];
+    }
+
+    const tsPart = debugTimestampPart(debugOptions);
+
+    // Fast path: nothing styled anywhere (timestamps off + unstyled parts) —
+    // emit plain arguments with no format string at all.
+    if (!tsPart && parts.every(part => part.style === undefined)) {
+        const text = parts.map(part => part.text).join('');
+        return tail.length > 0 ? [text, ...tail] : [text];
+    }
+
+    // Styled mode: single format string, every %c paired with %s.
+    //
+    // ⚠️ %c styling PERSISTS until the next %c — without an explicit reset
+    // (`%c` + empty style argument), the dimmed timestamp / badge colors
+    // would bleed into every following text segment. A reset is emitted
+    // right before any unstyled content that follows a styled segment.
+    const specifiers: string[] = [];
+    const substitutions: unknown[] = [];
+    let styleOpen = false;
+    const closeStyle = () => {
+        if (styleOpen) {
+            specifiers.push('%c');
+            substitutions.push('');
+            styleOpen = false;
+        }
+    };
+    for (const part of tsPart ? [tsPart, ...parts] : parts) {
+        if (part.style !== undefined) {
+            specifiers.push('%c%s');
+            substitutions.push(part.style, part.text);
+            styleOpen = true;
+        } else {
+            closeStyle();
+            specifiers.push('%s');
+            substitutions.push(part.text);
+        }
+    }
+    if (tail.length > 0) {
+        closeStyle();
+    }
+
+    const args: unknown[] = [specifiers.join(''), ...substitutions];
+    if (tail.length > 0) {
+        args.push(...tail);
+    }
+    return args;
+};
+
+type SnapshotMode = 'flat' | 'tree';
+
+type SnapshotByPrefixOptions = {
+    /**
+     * - `'flat'` (default): section → path → state. Best for scanning/searching.
+     * - `'tree'`: paths nested by segment-aware containment, closest physical
+     *   ancestor first. Sections owning the exact path are grouped under
+     *   `__state__`; children under `__children__`.
+     */
+    mode?: SnapshotMode;
+
+    /**
+     * How `pathPrefix` is matched against stored paths:
+     *
+     * - `'segment'` (default): subtree semantics — `/tabs/1` matches
+     *   `/tabs/1` itself plus every descendant (`/tabs/1/x`, `/tabs/1[0]`)
+     *   but never `/tabs/10`.
+     * - `'exact'`: only paths EQUAL to a given prefix are included — ideal
+     *   for watching a single state slot without its whole subtree.
+     * - `'startsWith'`: raw `String.prototype.startsWith` matching (legacy).
+     */
+    match?: 'segment' | 'startsWith' | 'exact';
+
+    /**
+     * When true (default), values are round-tripped through the store's
+     * serializer/deserializer so BigInt/Decimal/Date render exactly like
+     * persistence would write them. Set false for a cheap live-reference dump.
+     *
+     * @default true
+     */
+    serialize?: boolean;
+
+    /**
+     * Include only state entries from these sections — hide unrelated or
+     * noisy sections from the snapshot dump.
+     */
+    sectionFilter?: Name | Name[];
+    /**
+     * Tree mode only: attach the live subscriber count per path node
+     * (`__subscribers__`) so leak/purge debugging doesn't need internals.
+     *
+     * @default false
+     */
+    includeSubscribers?: boolean;
 };
 
 /**
@@ -655,6 +1158,9 @@ const deepFreeze = <T>(
 
 export {
     arraySectionGenerator,
+    composeDebugLogArgs,
+    createMemoryStorage,
+    debugTimestampArgs,
     deepFreeze,
     extractArrayIndexAndRemainedPathQuery,
     extractObjectIndexAndRemainedPathQuery,
@@ -665,9 +1171,13 @@ export {
     objectSectionGenerator,
     propertyUpdaterGenerator,
     snapshot,
+    snapshotByPrefix,
     type ArraySection,
+    type MemoryStorage,
     type ObjectSection,
     type ObjectSectionState,
     type SectionWithName,
+    type SnapshotByPrefixOptions,
+    type SnapshotMode,
     type UpdatingKeyAndValue
 };

@@ -9,12 +9,18 @@ export {
     type ObjectSectionState,
     type SectionWithName,
     type UpdatingKeyAndValue,
+    createMemoryStorage,
     getFieldSetter,
     isPathWithinPrefix,
     arraySectionGenerator,
     mergeUpdaterGenerator,
     objectSectionGenerator,
-    propertyUpdaterGenerator
+    propertyUpdaterGenerator,
+    snapshot,
+    snapshotByPrefix,
+    type MemoryStorage,
+    type SnapshotByPrefixOptions,
+    type SnapshotMode
 } from './util';
 export {
     type Store,
@@ -23,6 +29,7 @@ export {
     type Name,
     type Path,
     type DebugOptions,
+    type SnapshotFilter,
     type PayloadAndPayloadCreator,
     type StoreOptions,
     type PersistConfig,

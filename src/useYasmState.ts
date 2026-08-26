@@ -1,5 +1,12 @@
 import { YasmContext } from './Context';
-import { deepFreeze, immer, isPathWithinPrefix, snapshot } from './util';
+import {
+    composeDebugLogArgs,
+    deepFreeze,
+    immer,
+    isPathWithinPrefix,
+    snapshot,
+    snapshotByPrefix
+} from './util';
 import { useContext, useSyncExternalStore } from 'react';
 import {
     Name,
@@ -324,29 +331,70 @@ const init = <SM extends Record<Name, Section>, N extends keyof SM>(
         const isFilteredLog =
             typeof store.debugOptions.logStateUpdates === 'function';
 
+        // When `debugOptions.snapshotFilter` is configured, full-store debug
+        // snapshots are scoped down to the matching subtree/sections instead
+        // of serializing the entire `store.state` (see `snapshotByPrefix`).
+        // 'local' snapshots are already tiny and stay untouched.
+        const resolveLoggedState = () => {
+            const { snapshotFilter } = store.debugOptions;
+
+            if (
+                snapshotScope === 'full' &&
+                snapshotFilter !== undefined &&
+                (snapshotFilter.pathFilter !== undefined ||
+                    snapshotFilter.sectionFilter !== undefined)
+            ) {
+                // Conditional spread — see the note in purge.ts about
+                // `exactOptionalPropertyTypes`.
+                return snapshotByPrefix(
+                    store,
+                    snapshotFilter.pathFilter ?? '',
+                    {
+                        ...(snapshotFilter.mode !== undefined
+                            ? { mode: snapshotFilter.mode }
+                            : {}),
+                        ...(snapshotFilter.match !== undefined
+                            ? { match: snapshotFilter.match }
+                            : {}),
+                        ...(snapshotFilter.sectionFilter !== undefined
+                            ? { sectionFilter: snapshotFilter.sectionFilter }
+                            : {})
+                    }
+                );
+            }
+            return snapshotScope === 'full'
+                ? store.state
+                : state[routedName][routedPath];
+        };
+
         if (shouldLog) {
+            const badgeStyle =
+                'background: #0d9488; color: white; padding: 2px 6px; border-radius: 4px; font-weight: bold;';
+
             if (isFilteredLog) {
                 console.debug(
-                    `%cYASM (Filtered)%c updating "${String(routedName)}" at path "${routedPath}"`,
-                    'background: #0d9488; color: white; padding: 2px 6px; border-radius: 4px; font-weight: bold;',
-                    'color: inherit;'
+                    ...composeDebugLogArgs(store, [
+                        { text: 'YASM (Filtered)', style: badgeStyle },
+                        {
+                            text: ` updating "${String(routedName)}" at path "${routedPath}"`
+                        }
+                    ])
                 );
                 console.debug(resolvedPayload);
             } else {
                 console.debug(
-                    `YASM: updating "${String(routedName)}" at path "${routedPath}"`
+                    ...composeDebugLogArgs(store, [
+                        {
+                            text: `YASM: updating "${String(routedName)}" at path "${routedPath}"`
+                        }
+                    ])
                 );
                 console.debug(resolvedPayload);
             }
 
-            console.debug('before:');
+            console.debug(...composeDebugLogArgs(store, [{ text: 'Before:' }]));
 
-            snapshot(
-                snapshotScope === 'full'
-                    ? store.state
-                    : state[routedName][routedPath],
-                store
-            );
+            snapshot(resolveLoggedState(), store);
         }
 
         state[routedName][routedPath] = nextState;
@@ -355,13 +403,8 @@ const init = <SM extends Record<Name, Section>, N extends keyof SM>(
         store[SYMBOL_NOTIFY_CHANGE]();
 
         if (shouldLog) {
-            console.debug('after:');
-            snapshot(
-                snapshotScope === 'full'
-                    ? store.state
-                    : state[routedName][routedPath],
-                store
-            );
+            console.debug(...composeDebugLogArgs(store, [{ text: 'After:' }]));
+            snapshot(resolveLoggedState(), store);
             console.debug('--------');
         }
 

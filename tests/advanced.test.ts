@@ -226,8 +226,12 @@ test('debug options log local/full update and none/full purge snapshots', async 
     const localMessages = await captureDebug(() =>
         localStore.memo.State['/a'].updater({ value: 2 })
     );
-    assert.ok(localMessages.some(args => String(args[0]).includes('updating')));
-    assert.ok(localMessages.some(args => args[0] === 'before:'));
+    assert.ok(
+        localMessages.some(args =>
+            args.map(String).join(' ').includes('updating')
+        )
+    );
+    assert.ok(localMessages.some(args => args.includes('Before:')));
 
     const fullStore = createStore(
         { State: section },
@@ -243,8 +247,8 @@ test('debug options log local/full update and none/full purge snapshots', async 
     const fullMessages = await captureDebug(() =>
         purgeYasmState(fullStore, '/a')
     );
-    assert.ok(fullMessages.some(args => args[0] === 'before purge:'));
-    assert.ok(fullMessages.some(args => args[0] === 'after purge:'));
+    assert.ok(fullMessages.some(args => args.includes('before purge:')));
+    assert.ok(fullMessages.some(args => args.includes('after purge:')));
 });
 
 test('persistence supports custom-only saves, pre-hydration protection, and null snapshots', async () => {
@@ -349,10 +353,10 @@ test('useYasmStateUpdater returns a working updater without subscribing', () => 
     let capturedUpdater: ((payload: Partial<State>) => void) | undefined;
 
     const UpdaterOnly = () => {
-        capturedUpdater = useYasmStateUpdater<
-            typeof store.sectionMap,
-            'State'
-        >('State', '/wo');
+        capturedUpdater = useYasmStateUpdater<typeof store.sectionMap, 'State'>(
+            'State',
+            '/wo'
+        );
         return null;
     };
 
@@ -554,11 +558,15 @@ test('logStateUpdates filter callback narrows logging to matching events', async
     assert.ok(
         messages.some(
             args =>
-                String(args[0]).includes('YASM (Filtered)') &&
-                String(args[0]).includes('updating "State"')
+                args.map(String).join(' ').includes('YASM (Filtered)') &&
+                args.map(String).join(' ').includes('updating "State"')
         )
     );
     // Non-matching section updates and the purge event are filtered out
-    assert.ok(!messages.some(args => String(args[0]).includes('"Other"')));
-    assert.ok(!messages.some(args => String(args[0]).includes('purging')));
+    assert.ok(
+        !messages.some(args => args.map(String).join(' ').includes('"Other"'))
+    );
+    assert.ok(
+        !messages.some(args => args.map(String).join(' ').includes('purging'))
+    );
 });

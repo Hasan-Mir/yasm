@@ -1,4 +1,9 @@
-import { isPathWithinPrefix, snapshot } from './util';
+import {
+    composeDebugLogArgs,
+    isPathWithinPrefix,
+    snapshot,
+    snapshotByPrefix
+} from './util';
 import {
     SYMBOL_NOTIFY_CHANGE,
     SYMBOL_NOTIFY_FORCED_UNSUBSCRIBE,
@@ -84,27 +89,69 @@ const purgePathsWithinPrefix = <SM extends Record<Name, Section>>(
     const isFilteredLog =
         typeof store.debugOptions.logStateUpdates === 'function';
 
+    // When `debugOptions.snapshotFilter` is configured, full purge snapshots
+    // are scoped down to the matching subtree/sections instead of serializing
+    // `store.state`.
+    const resolveLoggedState = () => {
+        const { snapshotFilter } = store.debugOptions;
+
+        if (
+            purgeScope === 'full' &&
+            snapshotFilter !== undefined &&
+            (snapshotFilter.pathFilter !== undefined ||
+                snapshotFilter.sectionFilter !== undefined)
+        ) {
+            // Build the options object conditionally — under
+            // `exactOptionalPropertyTypes` an explicit `undefined` is not
+            // assignable to optional properties.
+            return snapshotByPrefix(store, snapshotFilter.pathFilter ?? '', {
+                ...(snapshotFilter.mode !== undefined
+                    ? { mode: snapshotFilter.mode }
+                    : {}),
+                ...(snapshotFilter.match !== undefined
+                    ? { match: snapshotFilter.match }
+                    : {}),
+                ...(snapshotFilter.sectionFilter !== undefined
+                    ? { sectionFilter: snapshotFilter.sectionFilter }
+                    : {})
+            });
+        }
+
+        return store.state;
+    };
+
     if (shouldLog) {
         const matchTypeStr =
             options?.match === 'startsWith'
                 ? 'starting with'
                 : 'matching segment';
 
-        if (isFilteredLog) {
-            console.debug(
-                `%cYASM (Filtered)%c purging paths ${matchTypeStr} "${pathPrefix}"`,
-                'background: #0d9488; color: white; padding: 2px 6px; border-radius: 4px; font-weight: bold;',
-                'color: inherit;'
-            );
-        } else {
-            console.debug(
-                `YASM: purging paths ${matchTypeStr} "${pathPrefix}"`
-            );
-        }
+        const badgeStyle =
+            'background: #ea580c; color: white; padding: 2px 6px; border-radius: 4px; font-weight: bold;';
+
+        const filteredBadgeStyle =
+            'background: #0d9488; color: white; padding: 2px 6px; border-radius: 4px; font-weight: bold;';
+
+        console.debug(
+            ...composeDebugLogArgs(store, [
+                { text: '🧹 YASM purging', style: badgeStyle },
+                ...(isFilteredLog
+                    ? [
+                          { text: ' ' },
+                          { text: '(Filtered)', style: filteredBadgeStyle }
+                      ]
+                    : []),
+                {
+                    text: ` paths ${matchTypeStr} "${pathPrefix}"`
+                }
+            ])
+        );
 
         if (purgeScope === 'full') {
-            console.debug('before purge:');
-            snapshot(store.state, store);
+            console.debug(
+                ...composeDebugLogArgs(store, [{ text: 'before purge:' }])
+            );
+            snapshot(resolveLoggedState(), store);
         }
     }
 
@@ -218,13 +265,22 @@ const purgePathsWithinPrefix = <SM extends Record<Name, Section>>(
 
     if (shouldLog) {
         console.debug(
-            `purge completed. Removed ${purgedPaths?.size} paths:`,
-            Array.from(purgedPaths || [])
+            ...composeDebugLogArgs(
+                store,
+                [
+                    {
+                        text: `purge completed. Removed ${purgedPaths?.size} paths:`
+                    }
+                ],
+                Array.from(purgedPaths || [])
+            )
         );
 
         if (purgeScope === 'full') {
-            console.debug('after purge:');
-            snapshot(store.state, store);
+            console.debug(
+                ...composeDebugLogArgs(store, [{ text: 'after purge:' }])
+            );
+            snapshot(resolveLoggedState(), store);
         }
 
         console.debug('--------');

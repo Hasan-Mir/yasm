@@ -9,7 +9,7 @@ const counterSection: Section<CounterState, Partial<CounterState>> = {
 };
 
 const captureConsole = async (
-    method: 'warn' | 'error',
+    method: 'warn' | 'error' | 'debug',
     fn: () => void | Promise<void>
 ): Promise<string[]> => {
     const original = console[method];

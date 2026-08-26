@@ -418,7 +418,11 @@ Routers compose recursively: a composed child can itself be a composed parent. A
 ```ts
 const rowForm = objectSectionGenerator({
     profile: { name: 'Profile', state: profileState, updater: profileUpdater },
-    settings: { name: 'Settings', state: settingsState, updater: settingsUpdater }
+    settings: {
+        name: 'Settings',
+        state: settingsState,
+        updater: settingsUpdater
+    }
 });
 
 const store = createStore({
@@ -428,9 +432,9 @@ const store = createStore({
     Settings: { initialState: settingsState, updater: settingsUpdater }
 });
 
-useYasmState('Table', '/table');                // the whole table
-useYasmState('Row', '/table[5]');               // row 5 (the whole form)
-useYasmState('Profile', '/table[5][profile]');  // just the profile of row 5
+useYasmState('Table', '/table'); // the whole table
+useYasmState('Row', '/table[5]'); // row 5 (the whole form)
+useYasmState('Profile', '/table[5][profile]'); // just the profile of row 5
 ```
 
 The path query is evaluated level by level — `[5]` selects the row inside the table, then the remaining `[profile]` is handed to the row's own routing. Note that each intermediate level must be in use first (its path is registered when a hook at that path initializes), following the parent-first rule below.
@@ -541,13 +545,13 @@ Every purge in YASM answers two separate questions:
 1. **Who decides the state is dead?** — always **you**, the application. YASM never destroys state on its own initiative: unmounting a component, switching tabs, or paginating rows never purges anything by itself. This is what makes state survive tab switches and page refreshes.
 2. **When is it actually destroyed?** — this is the only difference between the two APIs:
 
-|                                                       | `usePurgeYasmState()` → raw `purge(path)`                        | `usePurgeWhenUnused()` → safe `purgeWhenUnused(path)`                                                        |
-| :---------------------------------------------------- | :--------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------- |
-| **Timing**                                            | 🔥 Fire **now**, synchronously                                  | ⏳ Fire at the **first safe moment**: when the last matching subscriber unsubscribes (or immediately if none) |
-| **Safe inside a click handler that unmounts things?** | ❌ No — React has not unmounted yet → dev warning + UI resets    | ✅ Yes — by design                                                                                           |
-| **Revived paths** (row restored by a refetch)         | ❌ Wiped                                                         | ✅ Re-verified at fire time; live readers block the fire                                                     |
-| **Refresh during the pending window**                 | —                                                                | ✅ Pending purges are persisted and drained on next hydration                                                |
-| **Dev warning**                                       | ✅ Warns when subscribers are still attached (catches real bugs) | 🚫 Never warns                                                                                              |
+|                                                       | `usePurgeYasmState()` → raw `purge(path)`                        | `usePurgeWhenUnused()` → safe `purgeWhenUnused(path)`                                                         |
+| :---------------------------------------------------- | :--------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------ |
+| **Timing**                                            | 🔥 Fire **now**, synchronously                                   | ⏳ Fire at the **first safe moment**: when the last matching subscriber unsubscribes (or immediately if none) |
+| **Safe inside a click handler that unmounts things?** | ❌ No — React has not unmounted yet → dev warning + UI resets    | ✅ Yes — by design                                                                                            |
+| **Revived paths** (row restored by a refetch)         | ❌ Wiped                                                         | ✅ Re-verified at fire time; live readers block the fire                                                      |
+| **Refresh during the pending window**                 | —                                                                | ✅ Pending purges are persisted and drained on next hydration                                                 |
+| **Dev warning**                                       | ✅ Warns when subscribers are still attached (catches real bugs) | 🚫 Never warns                                                                                                |
 
 **💡 Rule of thumb: prefer `purgeWhenUnused`.** Use raw `purge` only when _immediacy itself_ is the requirement:
 
@@ -1069,6 +1073,108 @@ const store = createStore(APP_SECTIONS, {
 - A migration that produces fields absent from the section's `initialState` will see them pruned afterwards by default normalization (`pruneStaleFields: true`).
 - Do **not** put migration logic in `onBeforeSave`—that only affects future writes, never the data that is being read.
 
+### In-Memory Storage for Tests & SSR (`createMemoryStorage`)
+
+`createMemoryStorage()` builds an async-shaped, in-memory persistence adapter that plugs straight into `persist.storage`. Use it in unit tests, Storybook stories, and SSR environments where `localStorage`/`IndexedDB` don't exist — no hand-rolled mocks needed:
+
+```ts
+import { createStore, createMemoryStorage } from '@mrnafisia/yasm';
+
+const storage = createMemoryStorage();
+
+const store = createStore(APP_SECTIONS, {
+    persist: { key: 'test-state', storage }
+});
+
+await store.hydrate(); // resolves immediately — storage starts empty
+await store.save();
+
+// The backing Map is exposed directly for test assertions:
+assert.equal(storage.data.get('test-state'), /* serialized snapshot */);
+storage.clear(); // reset between tests
+```
+
+---
+
+## 🔍 Scoped Debug Snapshots (`snapshotByPrefix`)
+
+Debugging a large store with `snapshotScope: 'full'` dumps the _entire_ `store.state` before and after every update. `snapshotByPrefix()` gives you the same before/after view scoped to a single path subtree:
+
+```ts
+import { snapshotByPrefix } from '@mrnafisia/yasm';
+
+// Imperative use — returns data, never logs:
+const snap = snapshotByPrefix(store, '/tabs/12');
+console.debug(snap);
+
+// Omit the prefix to snapshot the ENTIRE store:
+console.debug(snapshotByPrefix(store));                 // flat, whole store
+console.debug(snapshotByPrefix(store, { mode: 'tree' })); // 🌳 whole store as a tree
+
+// diff around an update
+const before = snapshotByPrefix(store, '/tabs/12', { mode: 'tree' });
+update(...);
+const after = snapshotByPrefix(store, '/tabs/12', { mode: 'tree' });
+console.debug({ before, after });
+```
+
+**Overloads:** `snapshotByPrefix(store)` · `snapshotByPrefix(store, prefix | prefixes)` · `snapshotByPrefix(store, prefix, options?)` · `snapshotByPrefix(store, options?)`.
+
+**Store convenience method:** every store instance exposes the same signatures pre-bound — `store.snapshotByPrefix(...)` — with function overloads so VS Code autocomplete and type-checking work without repeating the store argument:
+
+```ts
+store.snapshotByPrefix('/tabs/12');                    // flat subtree
+store.snapshotByPrefix('/tabs/12', { mode: 'tree' });  // 🌳 nested subtree
+store.snapshotByPrefix(['/a', '/b']);                  // several subtrees
+store.snapshotByPrefix();                              // whole store, flat
+store.snapshotByPrefix({ mode: 'tree' });              // whole store as tree
+```
+
+**Options:**
+
+| Option               | Default     | Description                                                                                                                                                                                                          |
+| -------------------- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mode`               | `'flat'`    | `'flat'`: section → path → state (easy to scan). `'tree'`: paths nested under their closest matching physical ancestor — sections owning an exact path are grouped under `__state__`, children under `__children__`. |
+| `match`              | `'segment'` | `'segment'`: subtree-aware (same as purge) so `/tabs/1` never matches `/tabs/10`. `'exact'`: only paths equal to a prefix. `'startsWith'`: legacy raw prefix matching.                                                  |
+| `serialize`          | `true`      | Round-trip values through your serializer/deserializer so BigInt/Decimal/Date render exactly like persistence. `false` returns cheap live references.                                                                |
+| `includeSubscribers` | `false`     | Tree mode: attach live subscriber counts per path node (`__subscribers__`) for leak/purge debugging.                                                                                                                 |
+
+**Automatic filtered logging** via `debugOptions.snapshotFilter` — when set, every `full` update/purge snapshot is scoped/shaped accordingly instead of dumping the whole store. Every field is optional — set only what you need:
+
+```ts
+createStore(APP_SECTIONS, {
+    debugOptions: {
+        logStateUpdates: true,
+        snapshotScope: 'full',
+        purgeSnapshotScope: 'full',
+        snapshotFilter: {
+            pathFilter: '/tabs/1', // ← only this subtree in before/after (segment-aware)
+            sectionFilter: 'Tabs', // ← optional: hide unrelated sections from the dump
+            mode: 'tree' // ← nested hierarchy output
+        }
+    }
+});
+```
+
+- `pathFilter` — a prefix or an array of prefixes; `''` matches everything.
+- `sectionFilter` — a section name or an array of names; anything not listed is excluded from the dump even if its paths match `pathFilter`.
+- `match` — how `pathFilter` entries are matched: `'segment'` (default, subtree semantics), `'exact'` (only paths equal to a filter entry — watch a single slot without its subtree), or `'startsWith'`.
+- `mode` — `'flat'` (default) or `'tree'`, same as `snapshotByPrefix`'s option.
+
+Matching reuses YASM's segment-aware `isPathWithinPrefix` (including custom `pathBoundaryChars`) and the same serialization pipeline as persistence, so what you see in the console is exactly what storage would hold.
+
+**Timestamped, colored dev logs.** Development log lines (`YASM: updating…`, `🧹 YASM purging…`, `Before:` / `After:` …) carry a dimmed local timestamp (`HH:MM:SS.mmm`) by default. Purge lines open with an orange 🧹 **YASM purging** badge — always orange — and when a `logStateUpdates` filter callback is active, a teal **Filtered** tag follows it before the message text. Control the timestamp via `debugOptions.timestampFormatter`:
+
+```ts
+debugOptions: {
+    logStateUpdates: true,
+    timestampFormatter: date => date.toLocaleTimeString(), // your timezone
+    timestampFormatter: false                              // turn timestamps OFF
+}
+```
+
+> 💡 **Console-wrapper safe styling.** Styled dev logs are emitted as a single format string built from chained `%c`/`%s` specifiers (`'%c%s%c%s%c…'`): each styled segment is a `%c`+style argument pair, and a bare trailing `%c` with an empty style resets back to default so colors never bleed into following text. This chaining pattern renders correctly even in consoles/wrappers that mishandle adjacent bare `%c` arguments. If your console prints literal `%c` and raw CSS **entirely** (Node/SSR output, vConsole/eruda on mobile webviews), set `debugOptions.disableLogStyling: true`. Every dev log then becomes a single plain line — e.g. `[16:10:37.877] 🧹 YASM purging paths matching segment "/tabs/1"` — with the timestamp still included and zero `%c` markers.
+
 ---
 
 ## 🧪 Generic Sections
@@ -1149,17 +1255,17 @@ const useValueState = <T>(path: string, initial: T) => {
 
 ## ⚖️ Comparison with Other Libraries
 
-| Feature                    | **YASM**                                  | **Redux Toolkit**               | **Zustand**           | **Jotai**                  | **React Context**      |
-| :------------------------- | :---------------------------------------- | :------------------------------ | :-------------------- | :------------------------- | :--------------------- |
-| **Mental model**           | Sections × Paths                          | Single store + slices           | Store hooks           | Atoms                      | Tree-scoped values     |
-| **Multi-instance state**   | ✅ First-class (paths)                    | 🔶 Manual (keyed slices)       | 🔶 Store factories   | 🔶 Atom families          | 🔶 Nested providers   |
-| **Freeing memory (purge)** | ✅ One call per path prefix               | 🔶 Manual actions              | 🔶 Manual            | ✅ Auto GC-ish (unmount)   | ✅ Unmount             |
-| **Re-render precision**    | ✅ Per path + selector                    | ✅ Selectors                    | ✅ Selectors          | ✅ Per atom                | ❌ All consumers       |
+| Feature                    | **YASM**                                  | **Redux Toolkit**               | **Zustand**          | **Jotai**                  | **React Context**      |
+| :------------------------- | :---------------------------------------- | :------------------------------ | :------------------- | :------------------------- | :--------------------- |
+| **Mental model**           | Sections × Paths                          | Single store + slices           | Store hooks          | Atoms                      | Tree-scoped values     |
+| **Multi-instance state**   | ✅ First-class (paths)                    | 🔶 Manual (keyed slices)        | 🔶 Store factories   | 🔶 Atom families           | 🔶 Nested providers    |
+| **Freeing memory (purge)** | ✅ One call per path prefix               | 🔶 Manual actions               | 🔶 Manual            | ✅ Auto GC-ish (unmount)   | ✅ Unmount             |
+| **Re-render precision**    | ✅ Per path + selector                    | ✅ Selectors                    | ✅ Selectors         | ✅ Per atom                | ❌ All consumers       |
 | **Immutability**           | ✅ Immer built-in                         | ✅ Immer built-in               | 🔶 Manual/middleware | ✅                         | —                      |
-| **Boilerplate**            | Low                                       | Medium                          | Low                   | Low                        | Low                    |
-| **Devtools**               | ❌ (Logging only)                         | ✅ Excellent                    | ✅                    | ✅                         | ❌                     |
-| **Ecosystem/middleware**   | ❌ Minimal                                | ✅ Huge                         | ✅ Rich               | ✅ Rich                    | —                      |
-| **Best for**               | Tabbed/multi-instance apps (ERP, editors) | Large teams, strict conventions | General apps          | Fine-grained derived state | Rarely-changing config |
+| **Boilerplate**            | Low                                       | Medium                          | Low                  | Low                        | Low                    |
+| **Devtools**               | ❌ (Logging only)                         | ✅ Excellent                    | ✅                   | ✅                         | ❌                     |
+| **Ecosystem/middleware**   | ❌ Minimal                                | ✅ Huge                         | ✅ Rich              | ✅ Rich                    | —                      |
+| **Best for**               | Tabbed/multi-instance apps (ERP, editors) | Large teams, strict conventions | General apps         | Fine-grained derived state | Rarely-changing config |
 
 **When YASM shines**: Many simultaneous instances of the same screens whose state must be created and destroyed dynamically (tabs, windows, dialogs, wizards).
 
@@ -1169,26 +1275,28 @@ const useValueState = <T>(path: string, initial: T) => {
 
 ## 📚 API Reference (Summary)
 
-| Export                                            | Kind     | Description                                                                                                                           |
-| :------------------------------------------------ | :------- | :------------------------------------------------------------------------------------------------------------------------------------ |
-| `createStore(sectionMap, options?)`               | function | Creates the store. Options include debugging, persistence, path boundaries, serialization, and `onStateChange`.                       |
-| `store.hydrate()`                                 | method   | Loads and merges state + path registry from the configured persistence adapter. Await it before mounting consumers (see the hydration chapter). |
-| `store.isHydrated()`                              | method   | `true` once hydration finished — or immediately when no persistence is configured. Use it to gate rendering.                                    |
-| `store.save()`                                    | method   | Immediately saves through built-in and/or custom persistence.                                                                                  |
+| Export                                            | Kind     | Description                                                                                                                                                                       |
+| :------------------------------------------------ | :------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `createStore(sectionMap, options?)`               | function | Creates the store. Options include debugging, persistence, path boundaries, serialization, and `onStateChange`.                                                                   |
+| `store.hydrate()`                                 | method   | Loads and merges state + path registry from the configured persistence adapter. Await it before mounting consumers (see the hydration chapter).                                   |
+| `store.isHydrated()`                              | method   | `true` once hydration finished — or immediately when no persistence is configured. Use it to gate rendering.                                                                      |
+| `store.save()`                                    | method   | Immediately saves through built-in and/or custom persistence.                                                                                                                     |
 | `store.purgeWhenUnused(path, options?)`           | method   | Lifecycle-safe purge: executes when the last matching subscriber leaves (or immediately if none); persisted and drained on hydration. `path` is a prefix or an array of prefixes. |
-| `YasmContext`                                     | context  | Provide the store to your tree.                                                                                                                |
-| `useYasmState(name, path, selectorOrOptions?)`    | hook     | Returns `[state, updater]`. Options: `selector`, `overrideInitialState`.                                                                       |
-| `useYasmStateUpdater(name, path)`                 | hook     | Write-only access: returns just the updater; never subscribes or re-renders.                                                                   |
-| `usePurgeYasmState()`                             | hook     | Returns `purge(pathPrefix \| pathPrefix[], options?)`.                                                                                          |
-| `usePurgeWhenUnused()`                            | hook     | Lifecycle-safe purge: fires when the last matching subscriber leaves (or immediately if none). Accepts one prefix or an array of prefixes.       |
-| `purgeYasmState(store, path, options?)`           | function | Pure purge — usable outside React. `path` is a prefix or an array of prefixes.                                                                  |
-| `arraySectionGenerator(childName, childSection)`  | function | Ordered map of child states with routing.                                                                                             |
-| `objectSectionGenerator(map)`                     | function | Named composition of child sections with routing.                                                                                     |
-| `mergeUpdaterGenerator<S>()`                      | function | `Partial<S>` shallow-merge updater.                                                                                                   |
-| `propertyUpdaterGenerator<S>()`                   | function | `{ key, value }` updater.                                                                                                             |
-| `getFieldSetter(updateState, field)`              | function | Cached per-field setter factory.                                                                                                      |
-| `isPathWithinPrefix(path, prefix, boundaryChars)` | function | Segment-aware prefix check.                                                                                                           |
-| `DEFAULT_PATH_BOUNDARY_CHARS`                     | constant | The default segment boundaries (`'/'`, `'['`, `'.'`); customize via the `pathBoundaryChars` store option.                             |
+| `YasmContext`                                     | context  | Provide the store to your tree.                                                                                                                                                   |
+| `useYasmState(name, path, selectorOrOptions?)`    | hook     | Returns `[state, updater]`. Options: `selector`, `overrideInitialState`.                                                                                                          |
+| `useYasmStateUpdater(name, path)`                 | hook     | Write-only access: returns just the updater; never subscribes or re-renders.                                                                                                      |
+| `usePurgeYasmState()`                             | hook     | Returns `purge(pathPrefix \| pathPrefix[], options?)`.                                                                                                                            |
+| `usePurgeWhenUnused()`                            | hook     | Lifecycle-safe purge: fires when the last matching subscriber leaves (or immediately if none). Accepts one prefix or an array of prefixes.                                        |
+| `purgeYasmState(store, path, options?)`           | function | Pure purge — usable outside React. `path` is a prefix or an array of prefixes.                                                                                                    |
+| `arraySectionGenerator(childName, childSection)`  | function | Ordered map of child states with routing.                                                                                                                                         |
+| `objectSectionGenerator(map)`                     | function | Named composition of child sections with routing.                                                                                                                                 |
+| `mergeUpdaterGenerator<S>()`                      | function | `Partial<S>` shallow-merge updater.                                                                                                                                               |
+| `propertyUpdaterGenerator<S>()`                   | function | `{ key, value }` updater.                                                                                                                                                         |
+| `getFieldSetter(updateState, field)`              | function | Cached per-field setter factory.                                                                                                                                                  |
+| `isPathWithinPrefix(path, prefix, boundaryChars)` | function | Segment-aware prefix check.                                                                                                                                                       |
+| `store.snapshotByPrefix(prefix?, options?)`       | method   | Pre-bound scoped snapshot (overloaded: prefix / prefix-array / options-only) — same result as the standalone helper.                                                               |
+| `createMemoryStorage()`                           | function | In-memory `persist.storage` adapter for tests/stories/SSR; exposes its backing `Map` as `.data`.                                                                                  |
+| `DEFAULT_PATH_BOUNDARY_CHARS`                     | constant | The default segment boundaries (`'/'`, `'['`, `'.'`); customize via the `pathBoundaryChars` store option.                                                                         |
 
 ---
 

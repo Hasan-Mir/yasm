@@ -1,4 +1,9 @@
-import { isPathWithinPrefix } from './util';
+import {
+    isPathWithinPrefix,
+    snapshotByPrefix,
+    type SnapshotByPrefixOptions,
+    type SnapshotMode
+} from './util';
 import { purgeYasmState, type PurgeOptions } from './purge';
 
 type Name = string;
@@ -155,6 +160,49 @@ type LogEvent<SM extends Record<Name, Section> = Record<Name, Section>> =
     | { type: 'update'; sectionName: keyof SM; path: Path; payload: unknown }
     | { type: 'purge'; pathPrefix: string };
 
+/**
+ * Filters and shaping for the FULL development snapshots (the before/after
+ * dumps logged around updates and purges). Only consulted when
+ * `snapshotScope` / `purgeSnapshotScope` are `'full'`; every field is
+ * optional — set only what you need.
+ */
+type SnapshotFilter = {
+    /**
+     * Include only state entries whose path matches one of these prefixes.
+     * Segment-aware (same semantics as purge): `/tabs/1` will NOT match
+     * `/tabs/10`. An empty string matches everything. Omit to include all
+     * paths.
+     */
+    pathFilter?: string | string[];
+    /**
+     * Include only these sections — ideal for hiding unrelated or noisy
+     * sections from the before/after dump. Omit to include all sections.
+     */
+    sectionFilter?: Name | Name[];
+    /**
+     * How `pathFilter` entries are matched against stored paths:
+     *
+     * - `'segment'` (default): subtree semantics — `/tabs/1` matches the path
+     *   itself plus every descendant, but never `/tabs/10`.
+     * - `'exact'`: only paths EQUAL to a `pathFilter` entry are included —
+     *   ideal for watching a single state slot without its whole subtree.
+     * - `'startsWith'`: raw `String.prototype.startsWith` matching.
+     *
+     * @default 'segment'
+     */
+    match?: 'segment' | 'startsWith' | 'exact';
+    /**
+     * Output structure of the snapshot dump.
+     *
+     * - `'flat'` (default): section → path → state. Easiest to scan/search.
+     * - `'tree'`: paths nested under their closest matching physical ancestor,
+     *   mirroring how routed/composed children relate to their parents.
+     *
+     * @default 'flat'
+     */
+    mode?: SnapshotMode;
+};
+
 type DebugOptions<SM extends Record<Name, Section> = Record<Name, Section>> = {
     /**
      * Controls console logging for state mutations and purges in development.
@@ -166,6 +214,24 @@ type DebugOptions<SM extends Record<Name, Section> = Record<Name, Section>> = {
      *
      * Note: Depending on your `snapshotScope` and `purgeSnapshotScope` settings,
      * logging can serialize large parts of the store, causing performance overhead.
+     *
+     * @example
+     * debugOptions: {
+     *     logStateUpdates: true // log EVERY update and purge
+     * }
+     *
+     * @example
+     * // Filter callback (recommended for busy apps) — only log updates of
+     * // section "Cart" and every purge:
+     * debugOptions: {
+     *     logStateUpdates: event =>
+     *         event.type === 'purge' ||
+     *         (event.type === 'update' && event.sectionName === 'Cart')
+     * }
+     *
+     * @example
+     * // Turn logging off entirely:
+     * debugOptions: { logStateUpdates: false }
      *
      * @default false
      */
@@ -197,6 +263,71 @@ type DebugOptions<SM extends Record<Name, Section> = Record<Name, Section>> = {
      * @default 'none'
      */
     purgeSnapshotScope?: 'none' | 'full';
+
+    /**
+     * Filters and shaping applied to the FULL before/after debug snapshots.
+     * Only relevant when `snapshotScope` / `purgeSnapshotScope` are `'full'`
+     * (`'local'` / `'none'` snapshots are already tiny and stay untouched).
+     * Every field is optional — set only what you need.
+     *
+     * The standalone `snapshotByPrefix()` / `store.snapshotByPrefix()`
+     * accept the same controls imperatively.
+     *
+     * @example
+     * debugOptions: {
+     *     logStateUpdates: true,
+     *     snapshotScope: 'full',
+     *     purgeSnapshotScope: 'full',
+     *     snapshotFilter: {
+     *         pathFilter: '/tabs/1',   // segment-aware: won't match '/tabs/10'
+     *         sectionFilter: 'Tab',    // hide unrelated sections from the dump
+     *         mode: 'tree'             // 🌳 nested hierarchy output
+     *     }
+     * }
+     */
+    snapshotFilter?: SnapshotFilter;
+
+    /**
+     * Custom formatting for the dimmed timestamp prefixed to every
+     * development log line (`YASM: updating…`, `🧹 YASM purging…`,
+     * `Before:`, `After:` …).
+     *
+     * - `undefined` (default): dimmed local `HH:MM:SS.mmm`.
+     * - `(date) => string`: full control — e.g. `d => d.toLocaleTimeString()`
+     *   for system-timezone output, or an ISO string.
+     * - `false`: disables timestamps entirely (also when the formatter
+     *   returns an empty string).
+     *
+     * @example
+     * debugOptions: {
+     *     logStateUpdates: true,
+     *     timestampFormatter: date => date.toLocaleTimeString() // e.g. "5:08:49 PM"
+     *     // timestampFormatter: date => date.toISOString()    // full ISO stamp
+     *     // timestampFormatter: false                         // timestamps OFF
+     * }
+     */
+    timestampFormatter?: ((date: Date) => string) | false;
+
+    /**
+     * When true, all development logs are emitted as a SINGLE plain string —
+     * no `%c` styling segments at all (timestamp still included, inline).
+     *
+     * Use this in consoles that don't fully support chained `%c` styling
+     * (Node/SSR output, vConsole/eruda on mobile webviews, some logger
+     * wrappers) where styled logs would otherwise print literal `%c` markers
+     * and raw CSS.
+     *
+     * @example
+     * debugOptions: {
+     *     logStateUpdates: true,
+     *     disableLogStyling: true
+     *     // every line becomes plain text, e.g.:
+     *     // "[16:10:37.877] 🧹 YASM purging paths matching segment \"/tabs/1\""
+     * }
+     *
+     * @default false
+     */
+    disableLogStyling?: boolean;
 };
 
 /**
@@ -574,6 +705,26 @@ type Store<SM extends Record<Name, Section> = Record<Name, Section>> = {
         pathPrefix: string | string[],
         options?: PurgeOptions
     ) => void;
+
+    /**
+     * Convenience wrapper around the exported {@link snapshotByPrefix}()
+     * pre-bound to this store: returns a scoped debug/introspection snapshot
+     * containing the state entries whose path matches `pathPrefix`
+     * (segment-aware by default). Omitting the prefix snapshots the ENTIRE
+     * store. Never logs by itself.
+     *
+     * @example
+     * store.snapshotByPrefix('/tabs/12');                   // flat subtree
+     * store.snapshotByPrefix('/tabs/12', { mode: 'tree' }); // 🌳 nested subtree
+     * store.snapshotByPrefix(['/a', '/b']);                 // several subtrees
+     * store.snapshotByPrefix();                             // whole store, flat
+     * store.snapshotByPrefix({ mode: 'tree' });             // whole store as tree
+     */
+    snapshotByPrefix(
+        pathPrefix: string | string[],
+        options?: SnapshotByPrefixOptions
+    ): Record<string, any>;
+    snapshotByPrefix(options?: SnapshotByPrefixOptions): Record<string, any>;
 
     /**
      * Internal method used to trigger change listeners and persistence mechanisms
@@ -1069,6 +1220,28 @@ const createStore = <SM extends Record<Name, Section>>(
             }
         },
 
+        /**
+         * Pre-bound `snapshotByPrefix` — see the `Store` type docs for the
+         * overloaded signatures and examples.
+         */
+        snapshotByPrefix(
+            pathPrefixOrOptions?: string | string[] | SnapshotByPrefixOptions,
+            maybeOptions?: SnapshotByPrefixOptions
+        ) {
+            if (
+                typeof pathPrefixOrOptions === 'string' ||
+                Array.isArray(pathPrefixOrOptions)
+            ) {
+                return snapshotByPrefix(
+                    this,
+                    pathPrefixOrOptions,
+                    maybeOptions
+                );
+            }
+
+            return snapshotByPrefix(this, pathPrefixOrOptions);
+        },
+
         isHydrated() {
             // A store without persistence has nothing to wait for — it is
             // always "hydrated" from a consumer's point of view.
@@ -1121,376 +1294,372 @@ const createStore = <SM extends Record<Name, Section>>(
                         }
 
                         if (parsed.state === undefined) {
-                                parsed.state = {};
+                            parsed.state = {};
+                        }
+
+                        if (parsed.pathRegistry === undefined) {
+                            parsed.pathRegistry = {};
+                        }
+
+                        // Initialize metadata and executed migrations tracking
+                        executedMigrations = new Set<string>(
+                            parsed.metadata?.executedMigrations || []
+                        );
+
+                        // Capture deferred purges persisted by the
+                        // previous session; re-scheduled after the merge.
+                        const metadataPendingPurges =
+                            parsed.metadata?.pendingPurges;
+                        persistedPendingPurges = (
+                            Array.isArray(metadataPendingPurges)
+                                ? metadataPendingPurges
+                                : []
+                        ).filter(
+                            entry => typeof entry?.pathPrefix === 'string'
+                        );
+
+                        // 1. Run Managed Schema Migrations
+                        if (p.migrations) {
+                            for (const [
+                                sectionName,
+                                sectionMigrations
+                            ] of Object.entries(p.migrations)) {
+                                const storedSection = parsed.state[sectionName];
+
+                                const pendingMigrations = (
+                                    sectionMigrations as StateMigration[]
+                                ).filter(
+                                    migration =>
+                                        !executedMigrations.has(
+                                            `${sectionName}/${migration.id}`
+                                        )
+                                );
+
+                                if (pendingMigrations.length === 0) {
+                                    continue;
+                                }
+
+                                if (storedSection !== undefined) {
+                                    for (const stateValue of Object.values(
+                                        storedSection
+                                    )) {
+                                        for (const migration of pendingMigrations) {
+                                            await migration.migrate(
+                                                stateValue as Record<
+                                                    string,
+                                                    unknown
+                                                >
+                                            );
+                                        }
+                                    }
+                                }
+
+                                // Mark as executed even if section didn't exist in state
+                                // to prevent migrations from running again if the section is created later
+                                for (const migration of pendingMigrations) {
+                                    executedMigrations.add(
+                                        `${sectionName}/${migration.id}`
+                                    );
+                                }
+
+                                isStateChangedDuringHydration = true;
                             }
+                        }
 
-                            if (parsed.pathRegistry === undefined) {
-                                parsed.pathRegistry = {};
+                        // 2. Hook for arbitrary snapshot transformations
+                        if (p.onBeforeHydrate) {
+                            await p.onBeforeHydrate(parsed);
+                            isStateChangedDuringHydration = true; // Assume changes were made
+                        }
+
+                        // 3. Remove stale sections natively
+                        Object.keys(parsed.state).forEach(sectionName => {
+                            if (!(sectionName in this.sectionMap)) {
+                                delete parsed.state[sectionName];
+                                isStateChangedDuringHydration = true;
                             }
+                        });
 
-                            // Initialize metadata and executed migrations tracking
-                            executedMigrations = new Set<string>(
-                                parsed.metadata?.executedMigrations || []
-                            );
+                        Object.keys(parsed.pathRegistry).forEach(
+                            sectionName => {
+                                if (!(sectionName in this.pathRegistry)) {
+                                    delete parsed.pathRegistry[sectionName];
+                                    isStateChangedDuringHydration = true;
+                                }
+                            }
+                        );
 
-                            // Capture deferred purges persisted by the
-                            // previous session; re-scheduled after the merge.
-                            const metadataPendingPurges =
-                                parsed.metadata?.pendingPurges;
-                            persistedPendingPurges = (
-                                Array.isArray(metadataPendingPurges)
-                                    ? metadataPendingPurges
-                                    : []
-                            ).filter(
-                                entry => typeof entry?.pathPrefix === 'string'
-                            );
-
-                            // 1. Run Managed Schema Migrations
-                            if (p.migrations) {
-                                for (const [
-                                    sectionName,
-                                    sectionMigrations
-                                ] of Object.entries(p.migrations)) {
-                                    const storedSection =
-                                        parsed.state[sectionName];
-
-                                    const pendingMigrations = (
-                                        sectionMigrations as StateMigration[]
-                                    ).filter(
-                                        migration =>
-                                            !executedMigrations.has(
-                                                `${sectionName}/${migration.id}`
-                                            )
+                        // 4. Validate Path Registry against parsed State
+                        Object.keys(parsed.pathRegistry).forEach(
+                            sectionName => {
+                                const originalLength =
+                                    parsed.pathRegistry[sectionName].length;
+                                parsed.pathRegistry[sectionName] =
+                                    parsed.pathRegistry[sectionName].filter(
+                                        (path: string) =>
+                                            parsed.state[sectionName]?.[
+                                                path
+                                            ] !== undefined
                                     );
 
-                                    if (pendingMigrations.length === 0) {
-                                        continue;
-                                    }
-
-                                    if (storedSection !== undefined) {
-                                        for (const stateValue of Object.values(
-                                            storedSection
-                                        )) {
-                                            for (const migration of pendingMigrations) {
-                                                await migration.migrate(
-                                                    stateValue as Record<
-                                                        string,
-                                                        unknown
-                                                    >
-                                                );
-                                            }
-                                        }
-                                    }
-
-                                    // Mark as executed even if section didn't exist in state
-                                    // to prevent migrations from running again if the section is created later
-                                    for (const migration of pendingMigrations) {
-                                        executedMigrations.add(
-                                            `${sectionName}/${migration.id}`
-                                        );
-                                    }
-
+                                if (
+                                    parsed.pathRegistry[sectionName].length !==
+                                    originalLength
+                                ) {
                                     isStateChangedDuringHydration = true;
                                 }
                             }
+                        );
 
-                            // 2. Hook for arbitrary snapshot transformations
-                            if (p.onBeforeHydrate) {
-                                await p.onBeforeHydrate(parsed);
-                                isStateChangedDuringHydration = true; // Assume changes were made
-                            }
+                        // 5. Normalize state and clear transient fields
+                        const norm = p.normalization;
+                        const shouldNormalize = norm !== false;
+                        const pruneStale =
+                            typeof norm === 'object'
+                                ? (norm.pruneStaleFields ?? true)
+                                : true;
 
-                            // 3. Remove stale sections natively
-                            Object.keys(parsed.state).forEach(sectionName => {
-                                if (!(sectionName in this.sectionMap)) {
-                                    delete parsed.state[sectionName];
+                        if (shouldNormalize) {
+                            // Compares persisted values by their serialized
+                            // form (using the store's serializer so custom
+                            // types like BigInt/Decimal/Date are tagged
+                            // consistently). Returns undefined when
+                            // serialization fails — callers treat that as
+                            // "changed" (conservative).
+                            const serializeForCompare = (value: any) => {
+                                try {
+                                    return JSON.stringify(
+                                        value,
+                                        function (key, val) {
+                                            return options?.serializer
+                                                ? options.serializer(
+                                                      this as Record<
+                                                          string,
+                                                          unknown
+                                                      >,
+                                                      key,
+                                                      val
+                                                  )
+                                                : val;
+                                        }
+                                    );
+                                } catch {
+                                    return undefined;
+                                }
+                            };
+
+                            // Extract the core normalization logic for reuse in nested sections
+                            const defaultNormalize = (
+                                storedVal: any,
+                                initialVal: any,
+                                secName: string
+                            ) => {
+                                if (
+                                    storedVal === null ||
+                                    typeof storedVal !== 'object' ||
+                                    Array.isArray(storedVal)
+                                ) {
+                                    // The stored shape does not match the
+                                    // object-shaped initialState at all —
+                                    // the returned replacement differs from
+                                    // what is on disk, so persist it back.
                                     isStateChangedDuringHydration = true;
+                                    return { ...initialVal };
                                 }
-                            });
 
-                            Object.keys(parsed.pathRegistry).forEach(
-                                sectionName => {
-                                    if (!(sectionName in this.pathRegistry)) {
-                                        delete parsed.pathRegistry[sectionName];
-                                        isStateChangedDuringHydration = true;
-                                    }
-                                }
-                            );
-
-                            // 4. Validate Path Registry against parsed State
-                            Object.keys(parsed.pathRegistry).forEach(
-                                sectionName => {
-                                    const originalLength =
-                                        parsed.pathRegistry[sectionName].length;
-                                    parsed.pathRegistry[sectionName] =
-                                        parsed.pathRegistry[sectionName].filter(
-                                            (path: string) =>
-                                                parsed.state[sectionName]?.[
-                                                    path
-                                                ] !== undefined
-                                        );
-
-                                    if (
-                                        parsed.pathRegistry[sectionName]
-                                            .length !== originalLength
-                                    ) {
-                                        isStateChangedDuringHydration = true;
-                                    }
-                                }
-                            );
-
-                            // 5. Normalize state and clear transient fields
-                            const norm = p.normalization;
-                            const shouldNormalize = norm !== false;
-                            const pruneStale =
-                                typeof norm === 'object'
-                                    ? (norm.pruneStaleFields ?? true)
-                                    : true;
-
-                            if (shouldNormalize) {
-                                // Compares persisted values by their serialized
-                                // form (using the store's serializer so custom
-                                // types like BigInt/Decimal/Date are tagged
-                                // consistently). Returns undefined when
-                                // serialization fails — callers treat that as
-                                // "changed" (conservative).
-                                const serializeForCompare = (value: any) => {
-                                    try {
-                                        return JSON.stringify(
-                                            value,
-                                            function (key, val) {
-                                                return options?.serializer
-                                                    ? options.serializer(
-                                                          this as Record<
-                                                              string,
-                                                              unknown
-                                                          >,
-                                                          key,
-                                                          val
-                                                      )
-                                                    : val;
-                                            }
-                                        );
-                                    } catch {
-                                        return undefined;
-                                    }
+                                const merged: any = {
+                                    ...initialVal,
+                                    ...storedVal
                                 };
 
-                                // Extract the core normalization logic for reuse in nested sections
-                                const defaultNormalize = (
-                                    storedVal: any,
-                                    initialVal: any,
-                                    secName: string
-                                ) => {
-                                    if (
-                                        storedVal === null ||
-                                        typeof storedVal !== 'object' ||
-                                        Array.isArray(storedVal)
-                                    ) {
-                                        // The stored shape does not match the
-                                        // object-shaped initialState at all —
-                                        // the returned replacement differs from
-                                        // what is on disk, so persist it back.
-                                        isStateChangedDuringHydration = true;
-                                        return { ...initialVal };
-                                    }
+                                if (pruneStale) {
+                                    Object.keys(merged).forEach(key => {
+                                        if (!(key in initialVal)) {
+                                            delete merged[key];
+                                            isStateChangedDuringHydration = true;
+                                        }
+                                    });
+                                }
 
-                                    const merged: any = {
-                                        ...initialVal,
-                                        ...storedVal
-                                    };
-
-                                    if (pruneStale) {
-                                        Object.keys(merged).forEach(key => {
-                                            if (!(key in initialVal)) {
-                                                delete merged[key];
-                                                isStateChangedDuringHydration = true;
-                                            }
-                                        });
-                                    }
-
-                                    // Additive healing: keys that exist in the
-                                    // current initialState but are missing from
-                                    // the stored snapshot were just backfilled.
-                                    // The in-memory state is correct now, but it
-                                    // differs from what is on disk — mark the
-                                    // hydration as changed so the repair-save
-                                    // persists the healed value instead of
-                                    // re-healing it on every launch. (Only
-                                    // reachable when storedVal was an object;
-                                    // the primitive branch above replaces the
-                                    // whole value and is handled by callers.)
-                                    if (storedVal && typeof storedVal === 'object' && !Array.isArray(storedVal)) {
-                                        for (const key of Object.keys(initialVal)) {
-                                            if (!(key in storedVal)) {
-                                                isStateChangedDuringHydration = true;
-                                                break;
-                                            }
+                                // Additive healing: keys that exist in the
+                                // current initialState but are missing from
+                                // the stored snapshot were just backfilled.
+                                // The in-memory state is correct now, but it
+                                // differs from what is on disk — mark the
+                                // hydration as changed so the repair-save
+                                // persists the healed value instead of
+                                // re-healing it on every launch. (Only
+                                // reachable when storedVal was an object;
+                                // the primitive branch above replaces the
+                                // whole value and is handled by callers.)
+                                if (
+                                    storedVal &&
+                                    typeof storedVal === 'object' &&
+                                    !Array.isArray(storedVal)
+                                ) {
+                                    for (const key of Object.keys(initialVal)) {
+                                        if (!(key in storedVal)) {
+                                            isStateChangedDuringHydration = true;
+                                            break;
                                         }
                                     }
+                                }
 
-                                    if (typeof norm === 'object') {
-                                        Object.keys(merged).forEach(key => {
-                                            let isTrans = false;
-
-                                            if (
-                                                norm.transientPatterns?.some(
-                                                    regex => regex.test(key)
-                                                )
-                                            ) {
-                                                isTrans = true;
-                                            }
-
-                                            if (
-                                                norm.transientExact?.[
-                                                    secName as keyof SM
-                                                ]?.includes(key as any)
-                                            ) {
-                                                isTrans = true;
-                                            }
-
-                                            if (
-                                                norm.isTransient?.(
-                                                    secName as keyof SM,
-                                                    key
-                                                )
-                                            ) {
-                                                isTrans = true;
-                                            }
-
-                                            if (isTrans) {
-                                                if (
-                                                    merged[key] !==
-                                                    initialVal[key]
-                                                ) {
-                                                    merged[key] =
-                                                        initialVal[key];
-                                                    isStateChangedDuringHydration = true;
-                                                }
-                                            }
-                                        });
-                                    }
-
-                                    return merged;
-                                };
-
-                                const context: NormalizationContext = {
-                                    pruneStaleFields: pruneStale,
-                                    defaultNormalize
-                                };
-
-                                Object.keys(parsed.state).forEach(
-                                    sectionName => {
-                                        const section =
-                                            this.sectionMap[sectionName];
-                                        const storedSection =
-                                            parsed.state[sectionName];
-                                        const initial = section.initialState;
+                                if (typeof norm === 'object') {
+                                    Object.keys(merged).forEach(key => {
+                                        let isTrans = false;
 
                                         if (
-                                            initial === null ||
-                                            typeof initial !== 'object' ||
-                                            Array.isArray(initial)
+                                            norm.transientPatterns?.some(
+                                                regex => regex.test(key)
+                                            )
                                         ) {
-                                            return;
+                                            isTrans = true;
                                         }
 
-                                        Object.keys(storedSection).forEach(
-                                            path => {
-                                                const storedValue =
-                                                    storedSection[path];
+                                        if (
+                                            norm.transientExact?.[
+                                                secName as keyof SM
+                                            ]?.includes(key as any)
+                                        ) {
+                                            isTrans = true;
+                                        }
 
-                                                // Delegate to the section's own normalizer when available (such as ArraySection)
-                                                if (section.normalize) {
-                                                    // Snapshot the persisted
-                                                    // form BEFORE normalizing:
-                                                    // a normalize hook may
-                                                    // mutate `storedValue` in
-                                                    // place, which would taint
-                                                    // an afterwards-only
-                                                    // comparison.
-                                                    const beforeJson = serializeForCompare(storedValue);
-                                                    storedSection[path] =
-                                                        section.normalize(
-                                                            storedValue,
-                                                            context
-                                                        );
-                                                    // Only mark the hydration as changed when normalization actually
-                                                    // altered the persisted value — previously this was flagged
-                                                    // unconditionally, forcing a full repair-save on every boot for
-                                                    // every generated (Array/Object) section even when nothing changed.
-                                                    if (
-                                                        beforeJson === undefined ||
-                                                        beforeJson !== serializeForCompare(storedSection[path])
-                                                    ) {
-                                                        isStateChangedDuringHydration = true;
-                                                    }
-                                                } else {
-                                                    // Otherwise, use the default normalizer
-                                                    storedSection[path] =
-                                                        defaultNormalize(
-                                                            storedValue,
-                                                            initial,
-                                                            sectionName
-                                                        );
-                                                }
+                                        if (
+                                            norm.isTransient?.(
+                                                secName as keyof SM,
+                                                key
+                                            )
+                                        ) {
+                                            isTrans = true;
+                                        }
+
+                                        if (isTrans) {
+                                            if (
+                                                merged[key] !== initialVal[key]
+                                            ) {
+                                                merged[key] = initialVal[key];
+                                                isStateChangedDuringHydration = true;
                                             }
+                                        }
+                                    });
+                                }
+
+                                return merged;
+                            };
+
+                            const context: NormalizationContext = {
+                                pruneStaleFields: pruneStale,
+                                defaultNormalize
+                            };
+
+                            Object.keys(parsed.state).forEach(sectionName => {
+                                const section = this.sectionMap[sectionName];
+                                const storedSection = parsed.state[sectionName];
+                                const initial = section.initialState;
+
+                                if (
+                                    initial === null ||
+                                    typeof initial !== 'object' ||
+                                    Array.isArray(initial)
+                                ) {
+                                    return;
+                                }
+
+                                Object.keys(storedSection).forEach(path => {
+                                    const storedValue = storedSection[path];
+
+                                    // Delegate to the section's own normalizer when available (such as ArraySection)
+                                    if (section.normalize) {
+                                        // Snapshot the persisted
+                                        // form BEFORE normalizing:
+                                        // a normalize hook may
+                                        // mutate `storedValue` in
+                                        // place, which would taint
+                                        // an afterwards-only
+                                        // comparison.
+                                        const beforeJson =
+                                            serializeForCompare(storedValue);
+                                        storedSection[path] = section.normalize(
+                                            storedValue,
+                                            context
+                                        );
+                                        // Only mark the hydration as changed when normalization actually
+                                        // altered the persisted value — previously this was flagged
+                                        // unconditionally, forcing a full repair-save on every boot for
+                                        // every generated (Array/Object) section even when nothing changed.
+                                        if (
+                                            beforeJson === undefined ||
+                                            beforeJson !==
+                                                serializeForCompare(
+                                                    storedSection[path]
+                                                )
+                                        ) {
+                                            isStateChangedDuringHydration = true;
+                                        }
+                                    } else {
+                                        // Otherwise, use the default normalizer
+                                        storedSection[path] = defaultNormalize(
+                                            storedValue,
+                                            initial,
+                                            sectionName
                                         );
                                     }
+                                });
+                            });
+                        }
+
+                        // 6. Merge safely into current state
+                        // 🔒 (Deep merge paths to prevent overwriting paths created natively during hydration)
+                        Object.keys(parsed.state).forEach(sectionName => {
+                            const key = sectionName as keyof SM;
+                            this.state[key] = {
+                                ...this.state[key],
+                                ...(parsed.state as any)[key]
+                            };
+                        });
+
+                        Object.keys(parsed.pathRegistry).forEach(
+                            sectionName => {
+                                const key = sectionName as Name;
+                                // 🔒 Ensure uniqueness when merging path registries
+                                const existingPaths = new Set(
+                                    this.pathRegistry[key] || []
+                                );
+                                (parsed.pathRegistry as any)[key].forEach(
+                                    (p: string) => existingPaths.add(p)
+                                );
+                                this.pathRegistry[key] =
+                                    Array.from(existingPaths);
+                            }
+                        );
+
+                        // 7. Re-schedule deferred purges persisted by the
+                        // previous session. Consumers are not mounted yet
+                        // (hydrate gates rendering), so nothing is
+                        // subscribed and they execute immediately — a
+                        // refresh inside a pending window can never orphan
+                        // state, and pre-purge snapshots self-heal.
+                        if (persistedPendingPurges.length > 0) {
+                            for (const pending of persistedPendingPurges) {
+                                this.purgeWhenUnused(
+                                    pending.pathPrefix,
+                                    pending.match === 'startsWith'
+                                        ? { match: 'startsWith' }
+                                        : undefined
                                 );
                             }
 
-                            // 6. Merge safely into current state
-                            // 🔒 (Deep merge paths to prevent overwriting paths created natively during hydration)
-                            Object.keys(parsed.state).forEach(sectionName => {
-                                const key = sectionName as keyof SM;
-                                this.state[key] = {
-                                    ...this.state[key],
-                                    ...(parsed.state as any)[key]
-                                };
-                            });
+                            // Persist the purged snapshot (and clear the
+                            // pending markers) through the repair-save.
+                            isStateChangedDuringHydration = true;
+                        }
 
-                            Object.keys(parsed.pathRegistry).forEach(
-                                sectionName => {
-                                    const key = sectionName as Name;
-                                    // 🔒 Ensure uniqueness when merging path registries
-                                    const existingPaths = new Set(
-                                        this.pathRegistry[key] || []
-                                    );
-                                    (parsed.pathRegistry as any)[key].forEach(
-                                        (p: string) => existingPaths.add(p)
-                                    );
-                                    this.pathRegistry[key] =
-                                        Array.from(existingPaths);
-                                }
-                            );
-
-                            // 7. Re-schedule deferred purges persisted by the
-                            // previous session. Consumers are not mounted yet
-                            // (hydrate gates rendering), so nothing is
-                            // subscribed and they execute immediately — a
-                            // refresh inside a pending window can never orphan
-                            // state, and pre-purge snapshots self-heal.
-                            if (persistedPendingPurges.length > 0) {
-                                for (const pending of persistedPendingPurges) {
-                                    this.purgeWhenUnused(
-                                        pending.pathPrefix,
-                                        pending.match === 'startsWith'
-                                            ? { match: 'startsWith' }
-                                            : undefined
-                                    );
-                                }
-
-                                // Persist the purged snapshot (and clear the
-                                // pending markers) through the repair-save.
-                                isStateChangedDuringHydration = true;
-                            }
-
-                            // 8. Wake up any subscriber that mounted before
-                            // hydration finished so it re-reads its (possibly
-                            // replaced) state instead of showing the lazy
-                            // default forever.
-                            notifyAllSubscribers();
+                        // 8. Wake up any subscriber that mounted before
+                        // hydration finished so it re-reads its (possibly
+                        // replaced) state instead of showing the lazy
+                        // default forever.
+                        notifyAllSubscribers();
                     } else if (p.migrations) {
                         // 🛡️ Fresh install (empty storage): natively created
                         // state already matches the current schema, so every
@@ -1657,6 +1826,7 @@ export type {
     Section,
     Store,
     DebugOptions,
+    SnapshotFilter,
     StoreOptions,
     PersistConfig,
     StateMigration,
