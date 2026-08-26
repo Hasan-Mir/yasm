@@ -618,6 +618,27 @@ const serializeForSnapshot = <T>(
 };
 
 /**
+ * `serializeForSnapshot` with a safety net: debug tooling must NEVER crash
+ * the update/purge it is logging. A throwing app serializer/deserializer
+ * degrades the dump to the raw live value (warned once).
+ */
+const safeSerializeForSnapshot = <T>(
+    value: T,
+    storeOptions: StoreOptions<any>
+): unknown => {
+    try {
+        return serializeForSnapshot(value, storeOptions);
+    } catch (error) {
+        console.error(
+            'YASM [Error]: serializing a debug snapshot threw — dumping the raw live value instead. Check your serializer/deserializer: it should CONSTRUCT new instances (e.g. new Decimal(…)) and never mutate its inputs.\n',
+            error
+        );
+
+        return value;
+    }
+};
+
+/**
  * Logs a debug snapshot of `obj` to the console, round-tripping it through
  * the store's serializer/deserializer and preserving `undefined` values (via
  * a placeholder) so the logged copy matches what persistence would store.
@@ -626,7 +647,7 @@ const snapshot = (
     obj: Record<string, unknown>,
     storeOptions: StoreOptions<any>
 ) => {
-    console.debug(serializeForSnapshot(obj, storeOptions));
+    console.debug(safeSerializeForSnapshot(obj, storeOptions));
 };
 
 /**
@@ -728,7 +749,7 @@ function snapshotByPrefix<SM extends Record<Name, Section>>(
                 section: sectionKey,
                 path,
                 value: shouldSerialize
-                    ? serializeForSnapshot(sectionState[path], store)
+                    ? safeSerializeForSnapshot(sectionState[path], store)
                     : sectionState[path]
             });
         }
@@ -1112,18 +1133,24 @@ type SnapshotByPrefixOptions = {
 };
 
 /**
- * Deeply freezes an object to prevent mutation in development environments.
- * Handles circular references, avoids invoking getters, and includes symbols.
+ * Deeply freezes a plain object/array tree to prevent mutation in development
+ * environments. Handles circular references, avoids invoking getters, and
+ * includes symbols.
+ *
+ * ⚠️ ONLY plain objects and arrays are frozen — class instances (e.g.,
+ * Decimal) are left COMPLETELY untouched on purpose: they often carry an own
+ * `constructor` property pointing at the shared class function, and freezing
+ * that would freeze the class itself and its prototype, breaking ALL future
+ * constructions of it (`x.constructor = …` throws "Cannot assign to read
+ * only property 'constructor'") — as seen with decimal.js clones.
  */
 const deepFreeze = <T>(
     obj: T,
     seen: WeakSet<object> = new WeakSet<object>()
 ): T => {
-    // Base case: primitives and null
-    if (
-        obj === null ||
-        (typeof obj !== 'object' && typeof obj !== 'function')
-    ) {
+    // Base case: primitives, null, functions, and CLASS INSTANCES are skipped
+    // entirely — only arrays and plain objects are frozen/traversed.
+    if (!Array.isArray(obj) && !isRawObject(obj)) {
         return obj;
     }
 
@@ -1139,15 +1166,12 @@ const deepFreeze = <T>(
     for (const key of Reflect.ownKeys(descriptors)) {
         const descriptor = descriptors[key as keyof typeof descriptors];
 
-        // Only recurse if it's a standard value property (not a getter/setter)
+        // Only recurse into standard value properties (not getter/setter)
+        // that are themselves plain objects or arrays.
         if ('value' in descriptor) {
             const value = descriptor.value;
 
-            // Recurse into nested objects and functions
-            if (
-                value !== null &&
-                (typeof value === 'object' || typeof value === 'function')
-            ) {
+            if (Array.isArray(value) || isRawObject(value)) {
                 deepFreeze(value, seen);
             }
         }

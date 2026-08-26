@@ -246,6 +246,45 @@ test('snapshotFilter.sectionFilter excludes unrelated sections from full snapsho
     assert.doesNotMatch(combined, /amount/);
 });
 
+test('a throwing serializer degrades snapshots to raw values instead of crashing updates', async () => {
+    const store = createStore({ Tab: tabSection, Cell: cellSection }, {
+        deserializer: () => {
+            throw new Error('boom');
+        },
+        debugOptions: {
+            logStateUpdates: true,
+            snapshotScope: 'full',
+            timestampFormatter: false
+        }
+    } as any);
+    makeStoreSeeded(store);
+    init(store, 'Tab' as any, '/tabs/1' as any);
+
+    const captured: unknown[][] = [];
+    const warnings: string[] = [];
+    const originalDebug = console.debug;
+    const originalWarn = console.warn;
+    console.debug = (...args: unknown[]) => {
+        captured.push(args);
+    };
+    console.warn = (...args: unknown[]) => {
+        warnings.push(args.map(String).join(' '));
+    };
+    try {
+        // The update itself must NEVER throw because of debug tooling.
+        store.memo.Tab['/tabs/1'].updater({ title: 'updated' });
+    } finally {
+        console.debug = originalDebug;
+        console.warn = originalWarn;
+    }
+
+    // The raw live state is still dumped (degraded, not missing)...
+    assert.match(JSON.stringify(captured), /title/);
+    // ...with exactly one explanatory warning.
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /serializing a debug snapshot threw/);
+});
+
 test('snapshotByPrefix without a prefix snapshots the ENTIRE store as a tree', () => {
     const store = makeStore();
     const tree = snapshotByPrefix(store, { mode: 'tree' }) as any;
