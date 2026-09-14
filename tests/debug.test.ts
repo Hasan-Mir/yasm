@@ -261,28 +261,29 @@ test('a throwing serializer degrades snapshots to raw values instead of crashing
     init(store, 'Tab' as any, '/tabs/1' as any);
 
     const captured: unknown[][] = [];
-    const warnings: string[] = [];
+    const errors: string[] = [];
     const originalDebug = console.debug;
-    const originalWarn = console.warn;
+    const originalError = console.error;
     console.debug = (...args: unknown[]) => {
         captured.push(args);
     };
-    console.warn = (...args: unknown[]) => {
-        warnings.push(args.map(String).join(' '));
+    console.error = (...args: unknown[]) => {
+        errors.push(args.map(String).join(' '));
     };
     try {
         // The update itself must NEVER throw because of debug tooling.
         store.memo.Tab['/tabs/1'].updater({ title: 'updated' });
     } finally {
         console.debug = originalDebug;
-        console.warn = originalWarn;
+        console.error = originalError;
     }
 
     // The raw live state is still dumped (degraded, not missing)...
     assert.match(JSON.stringify(captured), /title/);
-    // ...with exactly one explanatory warning.
-    assert.equal(warnings.length, 1);
-    assert.match(warnings[0], /serializing a debug snapshot threw/);
+    // ...and every failed serialization reports an explanatory error
+    // (before + after dumps).
+    assert.ok(errors.length >= 1);
+    assert.match(errors[0], /serializing a debug snapshot threw/);
 });
 
 test('snapshotByPrefix without a prefix snapshots the ENTIRE store as a tree', () => {

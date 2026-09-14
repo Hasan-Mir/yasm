@@ -166,42 +166,43 @@ type LogEvent<SM extends Record<Name, Section> = Record<Name, Section>> =
  * `snapshotScope` / `purgeSnapshotScope` are `'full'`; every field is
  * optional — set only what you need.
  */
-type SnapshotFilter = {
-    /**
-     * Include only state entries whose path matches one of these prefixes.
-     * Segment-aware (same semantics as purge): `/tabs/1` will NOT match
-     * `/tabs/10`. An empty string matches everything. Omit to include all
-     * paths.
-     */
-    pathFilter?: string | string[];
-    /**
-     * Include only these sections — ideal for hiding unrelated or noisy
-     * sections from the before/after dump. Omit to include all sections.
-     */
-    sectionFilter?: Name | Name[];
-    /**
-     * How `pathFilter` entries are matched against stored paths:
-     *
-     * - `'segment'` (default): subtree semantics — `/tabs/1` matches the path
-     *   itself plus every descendant, but never `/tabs/10`.
-     * - `'exact'`: only paths EQUAL to a `pathFilter` entry are included —
-     *   ideal for watching a single state slot without its whole subtree.
-     * - `'startsWith'`: raw `String.prototype.startsWith` matching.
-     *
-     * @default 'segment'
-     */
-    match?: 'segment' | 'startsWith' | 'exact';
-    /**
-     * Output structure of the snapshot dump.
-     *
-     * - `'flat'` (default): section → path → state. Easiest to scan/search.
-     * - `'tree'`: paths nested under their closest matching physical ancestor,
-     *   mirroring how routed/composed children relate to their parents.
-     *
-     * @default 'flat'
-     */
-    mode?: SnapshotMode;
-};
+type SnapshotFilter<SM extends Record<Name, Section> = Record<Name, Section>> =
+    {
+        /**
+         * Include only state entries whose path matches one of these prefixes.
+         * Segment-aware (same semantics as purge): `/tabs/1` will NOT match
+         * `/tabs/10`. An empty string matches everything. Omit to include all
+         * paths.
+         */
+        pathFilter?: string | string[];
+        /**
+         * Include only these sections — ideal for hiding unrelated or noisy
+         * sections from the before/after dump. Omit to include all sections.
+         */
+        sectionFilter?: keyof SM | (keyof SM)[];
+        /**
+         * How `pathFilter` entries are matched against stored paths:
+         *
+         * - `'segment'` (default): subtree semantics — `/tabs/1` matches the path
+         *   itself plus every descendant, but never `/tabs/10`.
+         * - `'exact'`: only paths EQUAL to a `pathFilter` entry are included —
+         *   ideal for watching a single state slot without its whole subtree.
+         * - `'startsWith'`: raw `String.prototype.startsWith` matching.
+         *
+         * @default 'segment'
+         */
+        match?: 'segment' | 'startsWith' | 'exact';
+        /**
+         * Output structure of the snapshot dump.
+         *
+         * - `'flat'` (default): section → path → state. Easiest to scan/search.
+         * - `'tree'`: paths nested under their closest matching physical ancestor,
+         *   mirroring how routed/composed children relate to their parents.
+         *
+         * @default 'flat'
+         */
+        mode?: SnapshotMode;
+    };
 
 type DebugOptions<SM extends Record<Name, Section> = Record<Name, Section>> = {
     /**
@@ -285,7 +286,7 @@ type DebugOptions<SM extends Record<Name, Section> = Record<Name, Section>> = {
      *     }
      * }
      */
-    snapshotFilter?: SnapshotFilter;
+    snapshotFilter?: SnapshotFilter<SM>;
 
     /**
      * Custom formatting for the dimmed timestamp prefixed to every
@@ -722,9 +723,11 @@ type Store<SM extends Record<Name, Section> = Record<Name, Section>> = {
      */
     snapshotByPrefix(
         pathPrefix: string | string[],
-        options?: SnapshotByPrefixOptions
+        options?: SnapshotByPrefixOptions<SM>
     ): Record<string, any>;
-    snapshotByPrefix(options?: SnapshotByPrefixOptions): Record<string, any>;
+    snapshotByPrefix(
+        options?: SnapshotByPrefixOptions<SM>
+    ): Record<string, any>;
 
     /**
      * Internal method used to trigger change listeners and persistence mechanisms
@@ -1225,8 +1228,9 @@ const createStore = <SM extends Record<Name, Section>>(
          * overloaded signatures and examples.
          */
         snapshotByPrefix(
-            pathPrefixOrOptions?: string | string[] | SnapshotByPrefixOptions,
-            maybeOptions?: SnapshotByPrefixOptions
+            pathPrefixOrOptions?:
+                string | string[] | SnapshotByPrefixOptions<SM>,
+            maybeOptions?: SnapshotByPrefixOptions<SM>
         ) {
             if (
                 typeof pathPrefixOrOptions === 'string' ||

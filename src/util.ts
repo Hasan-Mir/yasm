@@ -677,16 +677,16 @@ const snapshot = (
 function snapshotByPrefix<SM extends Record<Name, Section>>(
     store: Store<SM>,
     pathPrefix: string | string[],
-    options?: SnapshotByPrefixOptions
+    options?: SnapshotByPrefixOptions<SM>
 ): Record<string, any>;
 function snapshotByPrefix<SM extends Record<Name, Section>>(
     store: Store<SM>,
-    options?: SnapshotByPrefixOptions
+    options?: SnapshotByPrefixOptions<SM>
 ): Record<string, any>;
 function snapshotByPrefix<SM extends Record<Name, Section>>(
     store: Store<SM>,
-    pathPrefixOrOptions?: string | string[] | SnapshotByPrefixOptions,
-    maybeOptions?: SnapshotByPrefixOptions
+    pathPrefixOrOptions?: string | string[] | SnapshotByPrefixOptions<SM>,
+    maybeOptions?: SnapshotByPrefixOptions<SM>
 ): Record<string, any> {
     const hasExplicitPrefix =
         typeof pathPrefixOrOptions === 'string' ||
@@ -696,9 +696,9 @@ function snapshotByPrefix<SM extends Record<Name, Section>>(
         ? (pathPrefixOrOptions as string | string[])
         : '';
 
-    const options: SnapshotByPrefixOptions | undefined =
+    const options: SnapshotByPrefixOptions<SM> | undefined =
         !hasExplicitPrefix && pathPrefixOrOptions !== undefined
-            ? (pathPrefixOrOptions as SnapshotByPrefixOptions)
+            ? (pathPrefixOrOptions as SnapshotByPrefixOptions<SM>)
             : maybeOptions;
 
     const mode = options?.mode ?? 'flat';
@@ -1088,7 +1088,9 @@ const composeDebugLogArgs = (
 
 type SnapshotMode = 'flat' | 'tree';
 
-type SnapshotByPrefixOptions = {
+type SnapshotByPrefixOptions<
+    SM extends Record<Name, Section> = Record<Name, Section>
+> = {
     /**
      * - `'flat'` (default): section → path → state. Best for scanning/searching.
      * - `'tree'`: paths nested by segment-aware containment, closest physical
@@ -1120,9 +1122,10 @@ type SnapshotByPrefixOptions = {
 
     /**
      * Include only state entries from these sections — hide unrelated or
-     * noisy sections from the snapshot dump.
+     * noisy sections from the snapshot dump. Autocompleted from the
+     * sections of the store.
      */
-    sectionFilter?: Name | Name[];
+    sectionFilter?: keyof SM | (keyof SM)[];
     /**
      * Tree mode only: attach the live subscriber count per path node
      * (`__subscribers__`) so leak/purge debugging doesn't need internals.
