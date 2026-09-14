@@ -103,7 +103,10 @@ const purgePathsWithinPrefix = <SM extends Record<Name, Section>>(
         ) {
             // Build the options object conditionally — under
             // `exactOptionalPropertyTypes` an explicit `undefined` is not
-            // assignable to optional properties.
+            // assignable to optional properties. `sectionFilter` is stored on
+            // the variance-safe `ResolvedDebugOptions` as `PropertyKey`; the
+            // cast is safe at runtime because the filter is only compared
+            // against section names from `Object.keys(store.state)`.
             return snapshotByPrefix(store, snapshotFilter.pathFilter ?? '', {
                 ...(snapshotFilter.mode !== undefined
                     ? { mode: snapshotFilter.mode }
@@ -112,7 +115,10 @@ const purgePathsWithinPrefix = <SM extends Record<Name, Section>>(
                     ? { match: snapshotFilter.match }
                     : {}),
                 ...(snapshotFilter.sectionFilter !== undefined
-                    ? { sectionFilter: snapshotFilter.sectionFilter }
+                    ? {
+                          sectionFilter: snapshotFilter.sectionFilter as
+                              keyof SM | (keyof SM)[]
+                      }
                     : {})
             });
         }

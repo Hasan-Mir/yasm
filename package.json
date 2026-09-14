@@ -20,7 +20,7 @@
     "author": "MRNafisiA <mnafisiasl@gmail.com>",
     "license": "MIT",
     "scripts": {
-        "build": "vite build --watch",
+        "build": "npm run checktype && vite build",
         "test": "tsx --test tests/*.test.ts",
         "test:react": "vitest run",
         "typecheck": "tsc -p tsconfig.test.json",

@@ -332,6 +332,28 @@ type DebugOptions<SM extends Record<Name, Section> = Record<Name, Section>> = {
 };
 
 /**
+ * Variance-safe shape of {@link DebugOptions} as stored on a
+ * {@link Store} instance.
+ *
+ * ⚠️ INTERNAL — user-facing options stay fully generic (`DebugOptions<SM>`,
+ * `SnapshotFilter<SM>`), so `sectionName` / `sectionFilter` autocomplete is
+ * inferred from the section map at the `createStore(...)` call site. The
+ * STORED copy, however, must not depend on a specific `SM`: callback
+ * parameters make generic types invariant, which would break assigning a
+ * concrete `Store<{ Tab: …; Cell: … }>` to the general `Store` type (React
+ * context, helpers, purge internals). Widening the event/filter types with
+ * `any` restores that assignability without weakening any public input type.
+ */
+type ResolvedDebugOptions = {
+    logStateUpdates?: boolean | ((event: LogEvent<any>) => boolean);
+    snapshotScope?: 'full' | 'local';
+    purgeSnapshotScope?: 'none' | 'full';
+    snapshotFilter?: SnapshotFilter<any>;
+    timestampFormatter?: ((date: Date) => string) | false;
+    disableLogStyling?: boolean;
+};
+
+/**
  * A minimal key-value storage engine. Every method may be synchronous or
  * asynchronous (YASM awaits results where needed) — `localStorage`,
  * `localforage`, `AsyncStorage`, or a custom adapter all fit this shape.
@@ -741,9 +763,9 @@ type Store<SM extends Record<Name, Section> = Record<Name, Section>> = {
      * unsubscribe. Hidden via Symbol.
      */
     [SYMBOL_NOTIFY_FORCED_UNSUBSCRIBE]: (name: Name, path: Path) => void;
-} & Required<
-    Pick<StoreOptions<SM>, 'serializer' | 'deserializer' | 'debugOptions'>
->;
+} & Required<Pick<StoreOptions<SM>, 'serializer' | 'deserializer'>> & {
+        debugOptions: Required<ResolvedDebugOptions>;
+    };
 
 /** The default path segment boundaries: `'/'`, `'['` and `'.'`. */
 const DEFAULT_PATH_BOUNDARY_CHARS = ['/', '[', '.'];
@@ -1092,7 +1114,13 @@ const createStore = <SM extends Record<Name, Section>>(
         pathBoundaryChars: boundaryChars,
         serializer: options?.serializer ?? ((_, __, value) => value),
         deserializer: options?.deserializer ?? ((_, value) => value),
-        debugOptions: options?.debugOptions ?? {},
+        // The stored copy uses the variance-safe `ResolvedDebugOptions`
+        // (see its docs): the generic input options are assignable at
+        // runtime, and the widened `logStateUpdates`/`snapshotFilter` types
+        // are sound because YASM only ever invokes them with events/filters
+        // derived from THIS store's own section map.
+        debugOptions: (options?.debugOptions ??
+            {}) as Required<ResolvedDebugOptions>,
 
         async save() {
             const p = options?.persist;

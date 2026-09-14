@@ -345,7 +345,9 @@ const init = <SM extends Record<Name, Section>, N extends keyof SM>(
                     snapshotFilter.sectionFilter !== undefined)
             ) {
                 // Conditional spread — see the note in purge.ts about
-                // `exactOptionalPropertyTypes`.
+                // `exactOptionalPropertyTypes` and the `sectionFilter`
+                // widening/cast rationale (runtime-safe: the filter is only
+                // compared against `Object.keys(store.state)`).
                 return snapshotByPrefix(
                     store,
                     snapshotFilter.pathFilter ?? '',
@@ -357,7 +359,11 @@ const init = <SM extends Record<Name, Section>, N extends keyof SM>(
                             ? { match: snapshotFilter.match }
                             : {}),
                         ...(snapshotFilter.sectionFilter !== undefined
-                            ? { sectionFilter: snapshotFilter.sectionFilter }
+                            ? {
+                                  sectionFilter:
+                                      snapshotFilter.sectionFilter as
+                                          keyof SM | (keyof SM)[]
+                              }
                             : {})
                     }
                 );
