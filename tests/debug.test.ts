@@ -691,19 +691,16 @@ test('log part seams are validated so plain output never mashes words', async ()
 });
 
 test('all built-in dev logs stay readable with disableLogStyling', async () => {
-    const store = createStore(
-        { Tab: tabSection, Cell: cellSection },
-        {
-            debugOptions: {
-                logStateUpdates: true,
-                snapshotScope: 'full',
-                purgeSnapshotScope: 'full',
-                snapshotFilter: { pathFilter: '/tabs/1' },
-                timestampFormatter: false,
-                disableLogStyling: true
-            }
-        } as any
-    );
+    const store = createStore({ Tab: tabSection, Cell: cellSection }, {
+        debugOptions: {
+            logStateUpdates: true,
+            snapshotScope: 'full',
+            purgeSnapshotScope: 'full',
+            snapshotFilter: { pathFilter: '/tabs/1' },
+            timestampFormatter: false,
+            disableLogStyling: true
+        }
+    } as any);
     makeStoreSeeded(store);
     init(store, 'Tab', '/tabs/1');
 

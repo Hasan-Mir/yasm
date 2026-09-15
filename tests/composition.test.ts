@@ -398,12 +398,20 @@ test('a throwing subscriber on one path does not block sibling notifications', (
     init(store, 'Table', '/t');
 
     const seen: string[] = [];
-    const unsubBad = store.subscribe(() => {
-        throw new Error('boom');
-    }, 'Table', '/t');
-    const unsubGood = store.subscribe(() => {
-        seen.push('ok');
-    }, 'Table', '/t');
+    const unsubBad = store.subscribe(
+        () => {
+            throw new Error('boom');
+        },
+        'Table',
+        '/t'
+    );
+    const unsubGood = store.subscribe(
+        () => {
+            seen.push('ok');
+        },
+        'Table',
+        '/t'
+    );
 
     // Must not throw out of the update fan-out...
     assert.doesNotThrow(() =>

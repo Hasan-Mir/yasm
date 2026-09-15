@@ -1566,7 +1566,9 @@ test('persistence: a throwing raw subscriber does not quarantine valid data', as
     await storage.setItem(
         'test-key',
         JSON.stringify({
-            state: { Dummy: { '/x': { count: 42, text: 'kept', isLoading: false } } },
+            state: {
+                Dummy: { '/x': { count: 42, text: 'kept', isLoading: false } }
+            },
             pathRegistry: {},
             metadata: { executedMigrations: [], pendingPurges: [] }
         })
@@ -1580,10 +1582,14 @@ test('persistence: a throwing raw subscriber does not quarantine valid data', as
     // App-style unguarded raw subscriber on a path that is never initialized
     // (lazily created + omitted from persistence): it THROWS during the
     // post-hydrate notification pass.
-    const unsubBad = store.subscribe(() => {
-        const s = store.state.Dummy['/never-initialized'];
-        if (s === undefined) throw new Error('unguarded mirror');
-    }, 'Dummy', '/mirror');
+    const unsubBad = store.subscribe(
+        () => {
+            const s = store.state.Dummy['/never-initialized'];
+            if (s === undefined) throw new Error('unguarded mirror');
+        },
+        'Dummy',
+        '/mirror'
+    );
 
     const notified: number[] = [];
     const unsubGood = store.subscribe(() => notified.push(1), 'Dummy', '/x');
@@ -1621,14 +1627,16 @@ test('persistence: primitive/null persisted roots are quarantined and repaired',
         // Raw payload backed up untouched under a quarantine key...
         const keys: string[] = [];
         storage.snapshot.forEach((_v, k) => keys.push(k));
-        const backupKey = keys.find(
-            k => k.startsWith('test-key_corrupted_backup_')
+        const backupKey = keys.find(k =>
+            k.startsWith('test-key_corrupted_backup_')
         );
         assert.ok(backupKey, `expected a quarantine key for root ${badRoot}`);
         assert.equal(await storage.getItem(backupKey as string), badRoot);
 
         // ...and the primary key overwritten with a clean snapshot.
-        const cleaned = JSON.parse((await storage.getItem('test-key')) as string);
+        const cleaned = JSON.parse(
+            (await storage.getItem('test-key')) as string
+        );
         assert.deepEqual(cleaned.state, { Dummy: {} });
         assert.equal(store.isHydrated(), true);
     }
@@ -1687,7 +1695,11 @@ test('persistence: normalize-hook sections do not force a repair-save when nothi
     };
 
     await store2.hydrate();
-    assert.equal(saveCalls, 0, 'unchanged normalize output must not trigger a repair-save');
+    assert.equal(
+        saveCalls,
+        0,
+        'unchanged normalize output must not trigger a repair-save'
+    );
 
     const afterHydrate = await storage.getItem('test-key');
     assert.equal(afterHydrate, beforeSave);
@@ -1807,9 +1819,7 @@ test('persistence: a throwing onQuarantine does not break hydration or the quara
 
     assert.equal(calls, 1);
     assert.ok(
-        errors.some(msg =>
-            String(msg).includes('onQuarantine callback failed')
-        )
+        errors.some(msg => String(msg).includes('onQuarantine callback failed'))
     );
     assert.equal(store.getHydrationStatus(), 'quarantined');
 

@@ -268,7 +268,9 @@ test('rollback: routed child with command-based updater restores captured state 
 
     init(store, 'TodoList', '/todos');
     store.memo.TodoList['/todos'].updater({
-        addingItems: [{ id: 1, partialState: { text: 'Initial', completed: false } }],
+        addingItems: [
+            { id: 1, partialState: { text: 'Initial', completed: false } }
+        ],
         order: [1]
     });
 
@@ -289,7 +291,10 @@ test('rollback: routed child with command-based updater restores captured state 
 });
 
 test('rollback: restores deeply nested routed child (Table -> Row -> Profile)', () => {
-    const profileSection: Section<{ name: string }, Partial<{ name: string }>> = {
+    const profileSection: Section<
+        { name: string },
+        Partial<{ name: string }>
+    > = {
         initialState: { name: '' },
         updater: mergeUpdaterGenerator<{ name: string }>()
     };
@@ -308,7 +313,9 @@ test('rollback: restores deeply nested routed child (Table -> Row -> Profile)', 
 
     init(store, 'Table', '/t');
     store.memo.Table['/t'].updater({
-        addingItems: [{ id: 1, partialState: { profile: { name: 'Initial' } } }],
+        addingItems: [
+            { id: 1, partialState: { profile: { name: 'Initial' } } }
+        ],
         order: [1]
     });
     init(store, 'Row', '/t[1]');

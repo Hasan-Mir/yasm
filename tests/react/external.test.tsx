@@ -15,11 +15,11 @@ test('an external (non-React) update still reaches mounted subscribers', () => {
     init(store, 'State', '/a');
 
     const Reader = () => {
-        const [value] = useYasmState<
-            typeof store.sectionMap,
+        const [value] = useYasmState<typeof store.sectionMap, 'State', number>(
             'State',
-            number
-        >('State', '/a', state => state.value);
+            '/a',
+            state => state.value
+        );
         return <span data-testid="reader">{value}</span>;
     };
 

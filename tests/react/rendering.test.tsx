@@ -20,11 +20,11 @@ test('two components on the same path stay in sync', () => {
     const store = createStore({ State: section });
 
     const Reader = () => {
-        const [value] = useYasmState<
-            typeof store.sectionMap,
+        const [value] = useYasmState<typeof store.sectionMap, 'State', number>(
             'State',
-            number
-        >('State', '/a', state => state.value);
+            '/a',
+            state => state.value
+        );
         return <span data-testid="reader">{value}</span>;
     };
 
@@ -90,11 +90,11 @@ test('a selector that stays stable skips re-renders on unrelated changes', () =>
     let readerRenders = 0;
 
     const Reader = () => {
-        const [value] = useYasmState<
-            typeof store.sectionMap,
+        const [value] = useYasmState<typeof store.sectionMap, 'State', number>(
             'State',
-            number
-        >('State', '/a', state => state.value);
+            '/a',
+            state => state.value
+        );
         readerRenders++;
         return <span data-testid="reader">{value}</span>;
     };

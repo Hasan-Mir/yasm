@@ -179,9 +179,14 @@ test('selector-aware subscribe: routed children observe parent updates through t
     });
 
     const titles: string[] = [];
-    store.subscribe('Row', '/t[3]', (row: Row) => row.title, title => {
-        titles.push(title);
-    });
+    store.subscribe(
+        'Row',
+        '/t[3]',
+        (row: Row) => row.title,
+        title => {
+            titles.push(title);
+        }
+    );
 
     store.memo.Table['/t'].updater({
         editingItems: [{ id: 3, itemPayload: { title: 'edited' } }]
@@ -239,11 +244,7 @@ test('selector-aware subscribe: a throwing listener is isolated from other subsc
 test('selector-aware subscribe: the low-level overload still works after the overload split', () => {
     const store = makeStore();
     let notified = 0;
-    const unsubscribe = store.subscribe(
-        () => notified++,
-        'Counter',
-        '/low'
-    );
+    const unsubscribe = store.subscribe(() => notified++, 'Counter', '/low');
     init(store, 'Counter', '/low');
     store.memo.Counter['/low'].updater({ count: 7 });
     assert.equal(notified, 1);

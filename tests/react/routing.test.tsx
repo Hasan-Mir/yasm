@@ -31,10 +31,7 @@ test('a parent-section reader re-renders when its routed row child updates', () 
 
     const TableReader = () => {
         // No selector: subscribes to the whole parent state
-        useYasmState<typeof store.sectionMap, 'Table', unknown>(
-            'Table',
-            '/t'
-        );
+        useYasmState<typeof store.sectionMap, 'Table', unknown>('Table', '/t');
         tableRenders++;
         return null;
     };
@@ -110,11 +107,11 @@ test('multi-level routing (Table → Row → Profile) works with mounted compone
     let tableRenders = 0;
 
     const ProfileReader = () => {
-        const [name] = useYasmState<
-            typeof store.sectionMap,
+        const [name] = useYasmState<typeof store.sectionMap, 'Profile', string>(
             'Profile',
-            string
-        >('Profile', '/table[5][profile]', state => state.name);
+            '/table[5][profile]',
+            state => state.name
+        );
         return <span data-testid="profile">{name}</span>;
     };
 
@@ -125,9 +122,7 @@ test('multi-level routing (Table → Row → Profile) works with mounted compone
             unknown
         >('Profile', '/table[5][profile]');
         return (
-            <button onClick={() => update({ name: 'Updated' })}>
-                rename
-            </button>
+            <button onClick={() => update({ name: 'Updated' })}>rename</button>
         );
     };
 

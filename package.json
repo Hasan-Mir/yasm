@@ -23,8 +23,11 @@
         "build": "npm run checktype && vite build",
         "test": "tsx --test tests/*.test.ts",
         "test:react": "vitest run",
+        "test:e2e": "playwright test",
+        "test:e2e:ui": "playwright test --ui",
         "checktype": "tsc -p tsconfig.test.json",
-        "prettier": "prettier --write src tests",
+        "checktype:e2e": "tsc -p e2e/tsconfig.json",
+        "prettier": "prettier --write src tests e2e",
         "eslint": "eslint --fix src tests"
     },
     "dependencies": {
@@ -35,6 +38,7 @@
         "react-dom": "^18.0.0 || ^19.0.0"
     },
     "devDependencies": {
+        "@playwright/test": "^1.63.0",
         "@testing-library/jest-dom": "^7.0.1",
         "@testing-library/react": "^14.3.1",
         "@types/node": "^26.1.2",
@@ -46,6 +50,7 @@
         "eslint-config-prettier": "^10.1.8",
         "eslint-plugin-react-hooks": "^7.1.1",
         "jsdom": "^30.0.1",
+        "localforage": "^1.10.0",
         "prettier": "^3.9.6",
         "react": "^18.2.0",
         "react-dom": "^18.2.0",
