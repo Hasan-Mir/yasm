@@ -817,9 +817,15 @@ export const StoreProvider = ({ children }: { children: ReactNode }) => {
     useEffect(() => {
         let cancelled = false;
 
-        store.hydrate().finally(() => {
-            if (!cancelled) setReady(true);
-        });
+        store
+            .hydrate()
+            // hydrate() only rejects when even the repair-save could not write
+            // storage (status lands on 'failed'). Handle it so it does not
+            // become an unhandled promise rejection.
+            .catch(error => console.error('YASM hydration failed:', error))
+            .finally(() => {
+                if (!cancelled) setReady(true);
+            });
 
         return () => {
             cancelled = true;

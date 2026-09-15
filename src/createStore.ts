@@ -821,14 +821,20 @@ type Store<SM extends Record<Name, Section> = Record<Name, Section>> = {
 
     /**
      * Selector-aware subscription: evaluates `selector` against the state at
-     * `(name, path)` whenever that path is updated (or purged) and invokes
-     * `listener` — but only when the selected value actually changed
-     * according to `options.equality` (default `'shallow'`).
+     * `(name, path)` whenever that path is UPDATED and invokes `listener` —
+     * but only when the selected value actually changed according to
+     * `options.equality` (default `'shallow'`).
+     *
+     * ⚠️ A purge does NOT notify: `purgeYasmState` removes the subscriber
+     * record outright, so the listener is detached silently and never fires
+     * for the destruction itself. Re-subscribe after a purge if you need to
+     * keep observing that path.
      *
      * The selector NEVER receives raw `undefined` for a valid section: a
      * lazily-uninitialized or purged path is evaluated against the section's
-     * `initialState` instead. The listener is isolated — a throwing listener
-     * is logged and never aborts other subscribers or the store dispatch.
+     * `initialState` instead (a fresh subscription re-initializes the path
+     * from `initialState`). The listener is isolated — a throwing listener is
+     * logged and never aborts other subscribers or the store dispatch.
      *
      * @example
      * store.subscribe(
@@ -1007,6 +1013,119 @@ type PendingPurge = {
      * subscribers when the purge was scheduled (or at the last re-snapshot).
      */
     pendingKeys: Set<string>;
+};
+
+/**
+ * Validates a persisted routing `pathRegistry` against the persisted state and
+ * drops the entries that can no longer be resolved.
+ *
+ * A registered routing path stays valid when EITHER
+ *
+ *   (a) the section owns state at that path (a top-level routing parent, e.g.
+ *       `Table` at `/table`), OR
+ *   (b) the section is itself routed into another surviving registration (a
+ *       composed parent nested inside another composed parent owns no state of
+ *       its own — e.g. `Row` at `/table[5]` lives inside `Table`'s state).
+ *
+ * Checking only (a) silently deleted every (b) entry on each boot, so deeper
+ * children (`/table[5][profile]`) could not resolve their parent after a reload
+ * and fell back to direct storage, orphaning the real data inside the parent.
+ *
+ * Pruning runs to a fixpoint — a whole pass is evaluated against the set as it
+ * was at the START of that pass, then the doomed entries are removed — so a
+ * stale parent also invalidates everything registered underneath it, and the
+ * result never depends on iteration order.
+ *
+ * Mutates `pathRegistry` in place and returns `true` when at least one entry
+ * was removed (the caller turns that into a repair-save).
+ *
+ * @throws when a registry entry is not an array (corrupted snapshot); the
+ *   caller's try/catch turns that into the documented quarantine flow.
+ */
+const pruneUnanchoredRegistrations = (
+    pathRegistry: Record<string, string[]>,
+    state: Record<string, Record<string, unknown> | undefined>,
+    routingPlan: Record<string, string[] | undefined>,
+    boundaryChars: string[]
+): boolean => {
+    const sectionNames = Object.keys(pathRegistry);
+
+    const surviving = new Map<string, Set<string>>();
+    for (const sectionName of sectionNames) {
+        const paths = pathRegistry[sectionName];
+        if (!Array.isArray(paths)) {
+            throw new Error(
+                `YASM: the persisted pathRegistry entry of section "${sectionName}" is not an array.`
+            );
+        }
+        surviving.set(
+            sectionName,
+            new Set<string>(paths.filter(path => typeof path === 'string'))
+        );
+    }
+
+    const isAnchored = (sectionName: string, path: string): boolean => {
+        if (state[sectionName]?.[path] !== undefined) {
+            return true;
+        }
+
+        const parentNames = routingPlan[sectionName];
+        if (parentNames === undefined) {
+            return false;
+        }
+
+        for (const parentName of parentNames) {
+            const parentPaths = surviving.get(parentName);
+            if (parentPaths === undefined) {
+                continue;
+            }
+            for (const parentPath of Array.from(parentPaths)) {
+                if (
+                    parentPath !== path &&
+                    isPathWithinPrefix(path, parentPath, boundaryChars)
+                ) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    };
+
+    let removedInPass = true;
+    while (removedInPass) {
+        removedInPass = false;
+        const doomed: [string, string][] = [];
+
+        for (const sectionName of sectionNames) {
+            for (const path of Array.from(surviving.get(sectionName)!)) {
+                if (!isAnchored(sectionName, path)) {
+                    doomed.push([sectionName, path]);
+                }
+            }
+        }
+
+        for (const [sectionName, path] of doomed) {
+            surviving.get(sectionName)!.delete(path);
+            removedInPass = true;
+        }
+    }
+
+    let changed = false;
+    for (const sectionName of sectionNames) {
+        const survivingPaths = surviving.get(sectionName)!;
+        const originalLength = pathRegistry[sectionName].length;
+
+        pathRegistry[sectionName] = pathRegistry[sectionName].filter(
+            path => typeof path === 'string' && survivingPaths.has(path)
+        );
+
+        if (pathRegistry[sectionName].length !== originalLength) {
+            changed = true;
+        }
+    }
+
+    return changed;
 };
 
 /**
@@ -1500,17 +1619,29 @@ const createStore = <SM extends Record<Name, Section>>(
                 // crash here. The "purged while components are still mounted"
                 // warning is emitted by `purgeYasmState` itself, which knows
                 // how many subscribers were attached at purge time.
-                const record = (
-                    subscribers[name] as
-                        Record<Path, Record<number, () => void>> | undefined
-                )?.[path];
+                const sectionRecords = subscribers[name] as
+                    Record<Path, Record<number, () => void>> | undefined;
+
+                if (sectionRecords === undefined) {
+                    return;
+                }
+
+                const record = sectionRecords[path];
 
                 if (record !== undefined) {
                     delete record[id];
 
-                    // 🧹 The last subscriber of this path just left — give
-                    // deferred purges waiting on it a chance to fire.
                     if (Object.keys(record).length === 0) {
+                        // 🧹 Drop the emptied record itself: leaving `{}`
+                        // behind made `subscribers[name]` grow with every path
+                        // ever subscribed, and every subscriber scan
+                        // (`collectSubscribedKeys` on each purgeWhenUnused,
+                        // `notifyAllSubscribers` after hydration) walks that
+                        // whole map.
+                        delete sectionRecords[path];
+
+                        // …then give deferred purges waiting on this path a
+                        // chance to fire.
                         handleLastSubscriberLeft(store, name.toString(), path);
                     }
                 }
@@ -2008,27 +2139,23 @@ const createStore = <SM extends Record<Name, Section>>(
                             }
                         );
 
-                        // 4. Validate Path Registry against parsed State
-                        Object.keys(parsed.pathRegistry).forEach(
-                            sectionName => {
-                                const originalLength =
-                                    parsed.pathRegistry[sectionName].length;
-                                parsed.pathRegistry[sectionName] =
-                                    parsed.pathRegistry[sectionName].filter(
-                                        (path: string) =>
-                                            parsed.state[sectionName]?.[
-                                                path
-                                            ] !== undefined
-                                    );
-
-                                if (
-                                    parsed.pathRegistry[sectionName].length !==
-                                    originalLength
-                                ) {
-                                    isStateChangedDuringHydration = true;
-                                }
-                            }
-                        );
+                        // 4. Validate Path Registry against parsed State.
+                        // Routed composed parents own no state of their own, so
+                        // they are anchored by their own surviving parent
+                        // registration instead (see the helper's docs).
+                        if (
+                            pruneUnanchoredRegistrations(
+                                parsed.pathRegistry,
+                                parsed.state,
+                                store.routingPlan as unknown as Record<
+                                    string,
+                                    string[] | undefined
+                                >,
+                                boundaryChars
+                            )
+                        ) {
+                            isStateChangedDuringHydration = true;
+                        }
 
                         // 5. Normalize state and clear transient fields
                         const norm = p.normalization;
@@ -2156,9 +2283,17 @@ const createStore = <SM extends Record<Name, Section>>(
                                     Object.keys(merged).forEach(key => {
                                         let isTrans = false;
 
+                                        // ⚠️ `RegExp.prototype.test` advances
+                                        // `lastIndex` for /g and /y patterns,
+                                        // which would let every second
+                                        // matching field slip through.
+                                        // `String#search` saves and restores
+                                        // `lastIndex`, so matching stays
+                                        // stateless and order-independent.
                                         if (
                                             norm.transientPatterns?.some(
-                                                regex => regex.test(key)
+                                                regex =>
+                                                    key.search(regex) !== -1
                                             )
                                         ) {
                                             isTrans = true;

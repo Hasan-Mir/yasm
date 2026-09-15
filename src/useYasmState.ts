@@ -255,8 +255,11 @@ const init = <SM extends Record<Name, Section>, N extends keyof SM>(
                 override === undefined
                     ? initialState
                     : Array.isArray(initialState)
-                      ? (Array.isArray(override) ? [...override] : [...initialState])
-                      : typeof initialState === 'object' && initialState !== null
+                      ? Array.isArray(override)
+                          ? [...override]
+                          : [...initialState]
+                      : typeof initialState === 'object' &&
+                          initialState !== null
                         ? { ...initialState, ...override }
                         : override;
 
@@ -648,7 +651,18 @@ const getExtraRoutes = <SM extends Record<Name, Section>>(
             ].join('\n')
         );
     }
-    const parent = candidates[0];
+    // Pick the CLOSEST registered ancestor (the longest matching prefix)
+    // rather than whichever happened to be registered first. `pathRegistry`
+    // ordering is not stable across sessions — after hydration live entries
+    // precede restored ones — so `candidates[0]` could resolve the same routed
+    // path through a different parent before and after a reload whenever two
+    // matching parent paths are nested. Ties keep the first candidate.
+    let parent = candidates[0];
+    for (const candidate of candidates) {
+        if (candidate.path.length > parent.path.length) {
+            parent = candidate;
+        }
+    }
     if (allNames.indexOf(parent.name) !== -1) {
         // Circular routing guard: stop resolving instead of recursing forever.
         return [parent];

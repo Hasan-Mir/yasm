@@ -40,20 +40,25 @@ The package entry point (`src/index.ts`) exposes the following runtime values:
 | `mergeUpdaterGenerator<S>()` | Returns a shallow `Partial<S>` updater; unchanged payloads preserve identity. |
 | `getFieldSetter(updateState, field)` | Returns a cached field setter accepting a value or previous-value callback. |
 | `isPathWithinPrefix(path, prefix, boundaryChars)` | Segment-aware prefix test; empty prefix matches every path. |
+| `snapshotByPrefix(store, pathPrefix?, options?)` | Scoped debug/introspection snapshot of the state entries matching `pathPrefix` (segment-aware by default). Options: `mode` (`'flat'` \| `'tree'`), `match` (`'segment'` \| `'exact'` \| `'startsWith'`), `serialize`, `sectionFilter`, `includeSubscribers`. Omitting the prefix snapshots the ENTIRE store. Never logs by itself. Also available pre-bound as `store.snapshotByPrefix(...)`. |
+| `snapshot(value, storeOptions)` | `console.debug`s `value` round-tripped through the store's serializer/deserializer, preserving `undefined` values through a placeholder. Never throws: a failing serializer degrades to the raw live value. |
+| `createMemoryStorage()` | In-memory `YasmPersistenceAdapter` for tests, stories and SSR; exposes the backing `Map` as `data` for assertions. |
 
 The entry point also exports TypeScript contracts: `Name`, `Path`, `Updater`,
 `PayloadAndPayloadCreator`, `Section`, `Store`, `StoreOptions`, `DebugOptions`,
-`PersistConfig`, `StateMigration`, `PersistedSnapshot`,
+`SnapshotFilter`, `PersistConfig`, `StateMigration`, `PersistedSnapshot`,
 `YasmPersistenceAdapter`, `HydrationStatus`, `HydrationResult`, `QuarantineInfo`,
 `SelectorEquality`, `SubscribeSelectorOptions`, `ArraySection`, `ObjectSection`,
-`ObjectSectionState`, `SectionWithName`, and `UpdatingKeyAndValue`.
+`ObjectSectionState`, `SectionWithName`, `UpdatingKeyAndValue`, `MemoryStorage`,
+`SnapshotByPrefixOptions`, and `SnapshotMode`.
 
 ### Store Surface and Persistence Options
 
 The public `Store` contains `state`, `subscribers`, `sectionMap`, `pathRegistry`,
 `routingPlan`, `memo`, `pathBoundaryChars`, `serializer`, `deserializer`,
 `debugOptions`, `subscribe`, `captureRollback`, `hydrate`, `save`, `isHydrated`,
-`getHydrationStatus`, `getHydrationSnapshot`, `subscribeHydration`, and `purgeWhenUnused`.
+`getHydrationStatus`, `getHydrationSnapshot`, `subscribeHydration`,
+`snapshotByPrefix`, and `purgeWhenUnused`.
 The symbol-keyed notification methods are internal integration points, exported from
 `src/createStore.ts` but not re-exported by the package entry point.
 
@@ -97,7 +102,13 @@ supports `key`, `storage`, static/function `omitSections`, boolean/function
 Updates resolve payload creators at dispatch time, use Immer for immutable
 replacement, notify `onStateChange`/persistence, and then invoke subscribers.
 Purge notifies only when actual state or registry data was removed. Hydration
-filters obsolete sections and paths, runs migrations before `onBeforeHydrate`,
+filters obsolete sections and paths — a persisted routing registration survives
+when the section owns state at that path OR the path is itself routed into
+another surviving registration, so nested composed parents (`Row` at
+`/table[5]` inside `Table` at `/table`, which own no state of their own) are
+kept instead of pruned; pruning runs to a fixpoint, so a stale parent still
+invalidates everything registered underneath it — runs migrations before
+`onBeforeHydrate`,
 normalizes before merging, writes a repaired snapshot when necessary, and
 notifies all live subscribers once after merging so components that mounted
 before hydration completed re-read their replaced state instead of showing
