@@ -4,7 +4,11 @@ import { init } from '../src/useYasmState';
 import { purgeYasmState } from '../src/purge';
 import { captureWarnings } from './helpers';
 import { Section, createStore } from '../src/createStore';
-import { arraySectionGenerator, mergeUpdaterGenerator } from '../src/util';
+import {
+    arraySectionGenerator,
+    mergeUpdaterGenerator,
+    objectSectionGenerator
+} from '../src/util';
 
 type CounterState = { count: number; label: string };
 const counterSection: Section<CounterState, Partial<CounterState>> = {
@@ -282,4 +286,38 @@ test('rollback: routed child with command-based updater restores captured state 
 
     assert.equal(store.state.TodoList['/todos'].map[1].completed, false);
     assert.equal(store.state.TodoList['/todos'].map[1].text, 'Initial');
+});
+
+test('rollback: restores deeply nested routed child (Table -> Row -> Profile)', () => {
+    const profileSection: Section<{ name: string }, Partial<{ name: string }>> = {
+        initialState: { name: '' },
+        updater: mergeUpdaterGenerator<{ name: string }>()
+    };
+    const rowForm = objectSectionGenerator({
+        profile: {
+            name: 'Profile',
+            state: profileSection.initialState,
+            updater: profileSection.updater
+        }
+    });
+    const store = createStore({
+        Table: arraySectionGenerator('Row', rowForm),
+        Row: rowForm,
+        Profile: profileSection
+    });
+
+    init(store, 'Table', '/t');
+    store.memo.Table['/t'].updater({
+        addingItems: [{ id: 1, partialState: { profile: { name: 'Initial' } } }],
+        order: [1]
+    });
+    init(store, 'Row', '/t[1]');
+    init(store, 'Profile', '/t[1][profile]');
+
+    const rollback = store.captureRollback('Profile', '/t[1][profile]');
+    store.memo.Profile['/t[1][profile]'].updater({ name: 'Mutated' });
+    assert.equal(store.state.Table['/t'].map[1].profile.name, 'Mutated');
+
+    rollback();
+    assert.equal(store.state.Table['/t'].map[1].profile.name, 'Initial');
 });

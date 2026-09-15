@@ -907,11 +907,19 @@ type Store<SM extends Record<Name, Section> = Record<Name, Section>> = {
     save: () => Promise<void>;
 
     /**
-     * Whether the store is ready for consumers:
+     * Whether hydration has settled (safe to stop warning about early init):
      *
-     * - `true` when hydration finished (or succeeded after a recovery), or
-     *   when no persistence is configured at all (nothing to wait for).
-     * - `false` while `hydrate()` is still in flight or failed/quarantined.
+     * - `true` once `hydrate()` finished (`'hydrated'`), recovered via
+     *   quarantine (`'quarantined'`), hit a terminal failure (`'failed'`),
+     *   or when no persistence is configured at all (nothing to wait for).
+     * - `false` while `hydrate()` was not called yet (`'idle'`) or is still
+     *   in flight (`'hydrating'`).
+     *
+     * This is the "settled" gate (not the snapshot's "usable data" flag):
+     * it stays `true` after terminal `'failed'` so the dev-only early-init
+     * warning in `init` fires at most once. For "is the data usable",
+     * read `getHydrationSnapshot().isHydrated` (which is `false` on
+     * `'failed'`) instead.
      *
      * Useful for gating rendering (`store.isHydrated() ? children : null`)
      * and for diagnostics. YASM also warns once per store, in development,
@@ -1057,7 +1065,9 @@ const createStore = <SM extends Record<Name, Section>>(
     let debounceTimer: ReturnType<typeof setTimeout> | undefined;
     let saveQueue: Promise<void> = Promise.resolve();
     let hydrationPromise: Promise<void> | undefined;
-    let isHydrated = false;
+    // ⚠️ "settled" ≠ "hydrated": stays `true` after terminal `'failed'` too
+    // (unlike snapshot `isHydrated`, which is `false` on `'failed'`).
+    let hydrationSettled = false;
     let hydrationSuccess = false;
 
     // Observable hydration lifecycle (see `HydrationStatus`). A store without
@@ -1677,7 +1687,7 @@ const createStore = <SM extends Record<Name, Section>>(
             }
 
             // 🛡️ Prevent saving a fresh state over the DB before hydration finishes
-            if (!isHydrated) {
+            if (!hydrationSettled) {
                 if (hydrationPromise) {
                     await hydrationPromise;
                     if (!hydrationSuccess) return; // Abort if hydration explicitly failed
@@ -1694,10 +1704,11 @@ const createStore = <SM extends Record<Name, Section>>(
             // the captured snapshot while the async queue is backed up.
             // NOTE: value objects are still shared with the live store —
             // persistence hooks must treat them as read-only.
-            const omittedSections =
-                typeof p.omitSections === 'function'
+            const omittedSections = [
+                ...(typeof p.omitSections === 'function'
                     ? p.omitSections(store.state)
-                    : p.omitSections || [];
+                    : p.omitSections || [])
+            ];
 
             Object.entries(store.sectionMap).forEach(([key, section]) => {
                 if (
@@ -1825,7 +1836,14 @@ const createStore = <SM extends Record<Name, Section>>(
         isHydrated() {
             // A store without persistence has nothing to wait for — it is
             // always "hydrated" from a consumer's point of view.
-            return isHydrated || options?.persist === undefined;
+            // ⚠️ This doubles as the "hydration settled" gate for the
+            // dev-only early-init warning in `init` (`useYasmState.ts`),
+            // so it stays `true` after terminal `'failed'` (unlike
+            // `getHydrationSnapshot().isHydrated`, which is `false` there).
+            // Do NOT rewrite this as `this.getHydrationSnapshot().isHydrated`
+            // — that both breaks destructured calls
+            // (`const { isHydrated } = store`) and changes `'failed'` semantics.
+            return hydrationSettled || options?.persist === undefined;
         },
 
         hydrate() {
@@ -1836,7 +1854,7 @@ const createStore = <SM extends Record<Name, Section>>(
 
             const p = options?.persist;
             if (!p || !p.key || !p.storage) {
-                isHydrated = true;
+                hydrationSettled = true;
                 hydrationSuccess = true;
                 setHydrationStatus('hydrated');
                 hydrationPromise = Promise.resolve();
@@ -1861,6 +1879,18 @@ const createStore = <SM extends Record<Name, Section>>(
 
                 try {
                     rawData = await storage.getItem(key);
+                } catch (error) {
+                    console.error(
+                        'YASM: Failed to hydrate state from storage.',
+                        error
+                    );
+                    setHydrationStatus('failed', error);
+                    hydrationSettled = true;
+                    hydrationSuccess = false;
+                    return;
+                }
+
+                try {
                     if (rawData) {
                         const parsed =
                             typeof rawData === 'string'
@@ -2043,6 +2073,34 @@ const createStore = <SM extends Record<Name, Section>>(
                                 initialVal: any,
                                 secName: string
                             ) => {
+                                if (initialVal === null) {
+                                    if (storedVal !== null) {
+                                        isStateChangedDuringHydration = true;
+                                    }
+                                    return null;
+                                }
+
+                                if (typeof initialVal !== 'object') {
+                                    if (
+                                        typeof storedVal ===
+                                            typeof initialVal &&
+                                        storedVal !== null
+                                    ) {
+                                        return storedVal;
+                                    }
+                                    isStateChangedDuringHydration = true;
+                                    return initialVal;
+                                }
+
+                                if (Array.isArray(initialVal)) {
+                                    if (!Array.isArray(storedVal)) {
+                                        isStateChangedDuringHydration = true;
+                                    }
+                                    return Array.isArray(storedVal)
+                                        ? storedVal
+                                        : [...initialVal];
+                                }
+
                                 if (
                                     storedVal === null ||
                                     typeof storedVal !== 'object' ||
@@ -2146,14 +2204,6 @@ const createStore = <SM extends Record<Name, Section>>(
                                 const section = store.sectionMap[sectionName];
                                 const storedSection = parsed.state[sectionName];
                                 const initial = section.initialState;
-
-                                if (
-                                    initial === null ||
-                                    typeof initial !== 'object' ||
-                                    Array.isArray(initial)
-                                ) {
-                                    return;
-                                }
 
                                 Object.keys(storedSection).forEach(path => {
                                     const storedValue = storedSection[path];
@@ -2343,7 +2393,7 @@ const createStore = <SM extends Record<Name, Section>>(
                     isStateChangedDuringHydration = true;
                 }
 
-                isHydrated = true;
+                hydrationSettled = true;
 
                 // 7. If state was modified during hydration, persist it back to storage
                 if (isStateChangedDuringHydration) {
@@ -2401,7 +2451,7 @@ const createStore = <SM extends Record<Name, Section>>(
             }
 
             // Do not schedule auto-saves if the store has not finished hydrating
-            if (!isHydrated) {
+            if (!hydrationSettled) {
                 return;
             }
 

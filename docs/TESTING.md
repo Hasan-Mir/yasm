@@ -74,7 +74,10 @@ supports `key`, `storage`, static/function `omitSections`, boolean/function
 - `saveQueue`: promise chain; each save appends one isolated persistence task
   capturing a call-time shallow copy of the state and registry.
 - `hydrationPromise`: single-flight promise reused by concurrent hydration calls.
-- `isHydrated`: blocks pre-hydration saves and autosave scheduling, then stays true.
+- `hydrationSettled`: "settled" gate for `store.isHydrated()` and the dev-only
+  early-init warning — blocks pre-hydration saves and autosave scheduling,
+  then stays `true` (unlike snapshot `isHydrated`, which is `false` on
+  `'failed'`).
 - `hydrationSuccess`: unlocked at the end of every hydrate run (including
   quarantined boots) so users can save again afterwards.
 - `hydrationStatus`: observable hydration state (`'idle'`, `'hydrating'`, `'hydrated'`,

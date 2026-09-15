@@ -107,7 +107,7 @@ type Updater<Name extends keyof SectionMap> = (
         | ((
               state: SectionMap[Name]['initialState']
           ) => Parameters<SectionMap[Name]['updater']>[1])
-) => SectionMap[Name]['initialState'] | void;
+) => void;
 
 type OverrideInitialState<Name extends keyof SectionMap> =
     | Partial<SectionMap[Name]['initialState']>
@@ -842,7 +842,7 @@ export const StoreProvider = ({ children }: { children: ReactNode }) => {
 >
 > You can also gate rendering programmatically with `store.isHydrated()` — it returns `true` once hydration finished, or right away when no persistence is configured.
 >
-> `hydrate()` resolves upon successful merge or when recovering from corrupted snapshots via quarantine (the session boots fresh and status lands on `'quarantined'`). It rejects **only** if an irrecoverable storage failure occurs during the repair-save (e.g. storage quota exceeded or disk write failure), transitioning the status to `'failed'` and setting the snapshot `error`. See **Corrupted Snapshot Handling** below.
+> `hydrate()` resolves upon successful merge or when recovering from corrupted snapshots via quarantine (the session boots fresh and status lands on `'quarantined'`). It swallows asynchronous storage write failures via the autosave queue, and only rejects on synchronous repair-save construction errors (like a throwing `omitSections` callback), transitioning the status to `'failed'` and setting the snapshot `error`. See **Corrupted Snapshot Handling** below.
 
 ### Gating on Hydration: `useHydration`
 

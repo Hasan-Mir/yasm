@@ -2066,6 +2066,40 @@ test('hydration status: an unrecoverable repair-save failure lands on failed', a
     assert.ok(snapshot.error !== undefined);
 });
 
+test('persistence: a storage getItem failure does not wipe existing data', async () => {
+    const storage = createMockStorage();
+    await storage.setItem(
+        'test-key',
+        JSON.stringify({
+            state: {
+                Dummy: { '/a': { count: 100, text: 'keep', isLoading: false } }
+            },
+            pathRegistry: {},
+            metadata: { executedMigrations: [], pendingPurges: [] }
+        })
+    );
+
+    // The real adapter stays readable — only the store's read path throws.
+    const brokenStorage = {
+        ...storage,
+        getItem: async () => {
+            throw new Error('Disk unreadable');
+        }
+    };
+
+    const store = createStore(
+        { Dummy: dummySection },
+        { persist: { key: 'test-key', storage: brokenStorage } }
+    );
+
+    await captureConsole('error', () => store.hydrate());
+    assert.equal(store.getHydrationStatus(), 'failed');
+
+    // The unreadable DB must not be overwritten with an empty state.
+    const raw = await storage.getItem('test-key');
+    assert.ok(raw?.includes('keep'));
+});
+
 test('hydration status: subscribeHydration unsubscribes per callback', async () => {
     const storage = createMockStorage();
     const store = createStore(

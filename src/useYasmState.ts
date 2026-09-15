@@ -58,7 +58,7 @@ function useYasmState<SM extends Record<Name, Section>, N extends keyof SM, S>(
     selector?: (state: SM[N]['initialState']) => S
 ): [
     unknown extends S ? SM[N]['initialState'] : S,
-    (payload: PayloadAndPayloadCreator<SM, N>) => SM[N]['initialState'] | void
+    (payload: PayloadAndPayloadCreator<SM, N>) => void
 ];
 
 // Overload 2: Use with options object (selector and/or overrideInitialState)
@@ -85,7 +85,7 @@ function useYasmState<SM extends Record<Name, Section>, N extends keyof SM, S>(
     }
 ): [
     unknown extends S ? SM[N]['initialState'] : S,
-    (payload: PayloadAndPayloadCreator<SM, N>) => SM[N]['initialState'] | void
+    (payload: PayloadAndPayloadCreator<SM, N>) => void
 ];
 
 function useYasmState<SM extends Record<Name, Section>, N extends keyof SM, S>(
@@ -99,7 +99,7 @@ function useYasmState<SM extends Record<Name, Section>, N extends keyof SM, S>(
           }
 ): [
     unknown extends S ? SM[N]['initialState'] : S,
-    (payload: PayloadAndPayloadCreator<SM, N>) => SM[N]['initialState'] | void
+    (payload: PayloadAndPayloadCreator<SM, N>) => void
 ] {
     const store = useContext(YasmContext) as Store<SM> | undefined;
 
@@ -254,7 +254,11 @@ const init = <SM extends Record<Name, Section>, N extends keyof SM>(
             const finalInitialState =
                 override === undefined
                     ? initialState
-                    : { ...initialState, ...override };
+                    : Array.isArray(initialState)
+                      ? (Array.isArray(override) ? [...override] : [...initialState])
+                      : typeof initialState === 'object' && initialState !== null
+                        ? { ...initialState, ...override }
+                        : override;
 
             if (process.env.NODE_ENV !== 'production') {
                 deepFreeze(finalInitialState);
@@ -570,8 +574,8 @@ const route = <SM extends Record<Name, Section>>(
             );
             return store.sectionMap[steps[stepIndex].name].routing![
                 steps[stepIndex + 1].name
-            ].updateByPathQuery(subState, pathQuery, () =>
-                update(stepIndex + 1, undefined)
+            ].updateByPathQuery(subState, pathQuery, (innerState: any) =>
+                update(stepIndex + 1, innerState)
             );
         };
         return update(0, state[routedName][routedPath]);

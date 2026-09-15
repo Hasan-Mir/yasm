@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { init } from '../src/useYasmState';
 import { purgeYasmState } from '../src/purge';
-import { createStore } from '../src/createStore';
+import { Section, createStore } from '../src/createStore';
 import { counterSection, captureWarnings } from './helpers';
 
 const makeStore = () => createStore({ Counter: counterSection });
@@ -54,6 +54,25 @@ test('overrideInitialState works in object and function forms', () => {
         count: initialState.count + 1
     }));
     assert.equal(store2.state.Counter['/b'].count, 1);
+});
+
+test('overrideInitialState preserves array prototypes', () => {
+    type Todo = { id: number; text: string };
+    const listSection: Section<Todo[], { add: Todo }> = {
+        initialState: [],
+        updater: (draft, { add }) => {
+            draft.push(add);
+        }
+    };
+
+    const store = createStore({ Todos: listSection });
+    init(store, 'Todos', '/list', [{ id: 1, text: 'First' }] as never);
+
+    assert.ok(Array.isArray(store.state.Todos['/list']));
+    assert.doesNotThrow(() => {
+        store.memo.Todos['/list'].updater({ add: { id: 2, text: 'Second' } });
+    });
+    assert.equal(store.state.Todos['/list'].length, 2);
 });
 
 test('subscribers are notified on update; unsubscribe stops notifications', () => {
