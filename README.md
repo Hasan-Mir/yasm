@@ -13,6 +13,7 @@ YASM organizes state as a grid of **Sections × Paths**. A _section_ defines the
 - 🧬 **Composable sections**: `arraySectionGenerator` and `objectSectionGenerator` build parent sections whose children are addressable through **path routing**: `useYasmState('Row', '/table[3]')` reads/writes the row _inside_ the table state immutably, with parent subscribers notified.
 - ⚡ **Precise re-renders**: Components subscribe per `(section, path)` and can narrow further with selectors. No top-down re-render cascades.
 - 📡 **Selector-aware subscriptions**: `store.subscribe(name, path, selector, listener, options?)` evaluates a selector on every update and invokes the listener only when the selection *actually changed* (`'shallow'` by default, `'strict'`, or a custom comparator) — the listener never receives raw `undefined` for a valid section.
+- 🔗 **Multi-path subscriptions**: `store.subscribeMany(targets, listener, options?)` watches many `(section, path)` addresses with **one** listener and **one** unsubscribe, batching everything that changed in the same flush into a single, fully-typed `changes` array.
 - 🛡️ **Observable hydration**: `useHydration()` (or `store.subscribeHydration()`) tracks `'idle' → 'hydrating' → 'hydrated' | 'quarantined' | 'failed'` so splash screens need no `useEffect` + `.finally(...)` boilerplate.
 - 🪝 **Quarantine callback**: `persist.onQuarantine` reports corrupted payloads (with the backup key and error) to error-tracking services — isolated, so it can never block the quarantine reset.
 - ↩️ **Optimistic rollback**: `store.captureRollback(name, path)` / `store.captureRollback(pathPrefix)` snapshot state and restore it on API rejection — idempotent, purge-safe, and a no-op when nothing changed.
@@ -701,6 +702,72 @@ usePurgeRemovedRows(
     dataSource.map(r => r.id)
 );
 ```
+
+---
+
+## 🔗 Watching Several Paths at Once (`subscribeMany`)
+
+Outside React you often need to mirror a handful of unrelated store addresses into some non-React sink (a theme object, an HTTP client, an analytics bridge). With `store.subscribe` that means one call — and one variable to track — per address:
+
+```ts
+const unsubBase = store.subscribe(() => { /* … */ }, 'BaseInfo', '/baseInfo');
+const unsubCred = store.subscribe(() => { /* … */ }, 'Credential', '/credential');
+
+// Teardown has to track both handles separately:
+unsubBase();
+unsubCred();
+```
+
+`store.subscribeMany` collapses that into one subscription with one teardown:
+
+```ts
+const unsubscribeAll = store.subscribeMany(
+    [
+        { name: 'BaseInfo', path: '/baseInfo' },
+        { name: 'Credential', path: '/credential' }
+    ],
+    changes => {
+        for (const change of changes) {
+            if (change.name === 'BaseInfo') {
+                // ✅ change.current is narrowed to BaseInfo's state — no cast
+                ManualStore.theme = change.current.theme;
+                ManualStore.token = change.current.token;
+            }
+
+            if (change.name === 'Credential') {
+                // ✅ narrowed to Credential's state
+                ManualStore.userUUID = change.current.uuid;
+            }
+        }
+    },
+    { fireImmediately: true }
+);
+
+// One call tears every address down:
+unsubscribeAll();
+```
+
+Each entry of `changes` is `{ name, path, current, previous }`. The array is a **discriminated union on `name`**, so narrowing on it also narrows `current` and `previous` to that section's state type.
+
+### Batching
+
+| `options.batch` | Behavior |
+| :--- | :--- |
+| `'microtask'` (default) | Every change from the same synchronous flush is coalesced into **one** listener call on the next microtask, with at most one entry per address (newest value wins). An address that changes and changes back inside that flush is dropped. |
+| `'sync'` | The listener runs inline, inside the dispatch that produced the change, with a single-entry batch. |
+
+Microtask batching is what makes the post-hydration notification pass arrive as a single call instead of one per path.
+
+### Guarantees
+
+- **Never `undefined`** — a lazily-uninitialized, purged, or unresolvable routed address is read as the section's `initialState`. Subscribing lazily initializes direct addresses, exactly like a hook would.
+- **Routed children** subscribe on their physical parent path, so a row at `/table[5]` is notified when its parent table updates.
+- **Isolated** — a throwing listener is logged and never aborts other subscribers, never breaks the store dispatch, and never reaches the hydration error boundary.
+- **Deduplicated** — repeating the same `(name, path)` target wires it once.
+- **Idempotent teardown** — calling the returned function twice is harmless.
+- `fireImmediately: true` invokes the listener once **synchronously** at subscription time with one entry per target and `previous: undefined`.
+
+> ⚠️ These are real subscriptions. The watched paths count as "in use", so a `purgeWhenUnused` over a matching prefix will wait until you unsubscribe.
 
 ---
 

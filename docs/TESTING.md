@@ -29,6 +29,7 @@ The package entry point (`src/index.ts`) exposes the following runtime values:
 | `purgeYasmState(store, pathPrefix, options?)` | Removes matching state, subscribers, memo records, and routing registrations. `PurgeOptions.match` is `'segment'` (default) or `'startsWith'`. |
 | `store.subscribe(cb, name, path)` | Low-level subscription backing `useSyncExternalStore` (unchanged). |
 | `store.subscribe(name, path, selector, listener, options?)` | Selector-aware subscription: fires `listener(selected, prevSelected)` only when the selection changed (`equality`: `'shallow'` default / `'strict'` / custom; `fireImmediately`: optional). Evaluates lazily-uninitialized/purged paths against `initialState`; isolates listener exceptions. |
+| `store.subscribeMany(targets, listener, options?)` | Multi-path subscription: watches several `(name, path)` addresses with one listener and one idempotent unsubscribe. Changes are discriminated by `name` (no casts) and, by default (`batch: 'microtask'`), coalesced per flush into one call with at most one entry per address; `batch: 'sync'` delivers single-entry batches inline. `fireImmediately` reports every target once with `previous: undefined`. Lazily initializes direct addresses, reads unresolvable/purged addresses as `initialState`, dedupes duplicate targets, and isolates listener exceptions. |
 | `store.captureRollback(name, path)` | Snapshots one path (through routing) and returns a `rollback()` restoring it; idempotent, purge-safe, reference-equality no-op when unchanged. |
 | `store.captureRollback(pathPrefix)` | Snapshots every state entry matching the segment-aware prefix and returns a `rollback()` restoring all of them; purged paths are skipped. |
 | `store.getHydrationStatus()` | Current hydration status: `'idle' \| 'hydrating' \| 'hydrated' \| 'failed' \| 'quarantined'`. |
@@ -50,7 +51,8 @@ The entry point also exports TypeScript contracts: `Name`, `Path`, `Updater`,
 `YasmPersistenceAdapter`, `HydrationStatus`, `HydrationResult`, `QuarantineInfo`,
 `SelectorEquality`, `SubscribeSelectorOptions`, `ArraySection`, `ObjectSection`,
 `ObjectSectionState`, `SectionWithName`, `UpdatingKeyAndValue`, `MemoryStorage`,
-`SnapshotByPrefixOptions`, and `SnapshotMode`.
+`SnapshotByPrefixOptions`, `SnapshotMode`, `SubscribeManyTarget`,
+`SubscribeManyChange`, and `SubscribeManyOptions`.
 
 ### Store Surface and Persistence Options
 
@@ -58,7 +60,7 @@ The public `Store` contains `state`, `subscribers`, `sectionMap`, `pathRegistry`
 `routingPlan`, `memo`, `pathBoundaryChars`, `serializer`, `deserializer`,
 `debugOptions`, `subscribe`, `captureRollback`, `hydrate`, `save`, `isHydrated`,
 `getHydrationStatus`, `getHydrationSnapshot`, `subscribeHydration`,
-`snapshotByPrefix`, and `purgeWhenUnused`.
+`snapshotByPrefix`, `subscribeMany`, and `purgeWhenUnused`.
 The symbol-keyed notification methods are internal integration points, exported from
 `src/createStore.ts` but not re-exported by the package entry point.
 
@@ -108,8 +110,8 @@ another surviving registration, so nested composed parents (`Row` at
 `/table[5]` inside `Table` at `/table`, which own no state of their own) are
 kept instead of pruned; pruning runs to a fixpoint, so a stale parent still
 invalidates everything registered underneath it — runs migrations before
-`onBeforeHydrate`,
-normalizes before merging, writes a repaired snapshot when necessary, and
+`onBeforeHydrate`, normalizes before merging, writes a repaired snapshot when
+necessary, and
 notifies all live subscribers once after merging so components that mounted
 before hydration completed re-read their replaced state instead of showing
 lazy defaults forever. When
@@ -146,6 +148,7 @@ logged, and never reject `hydrate()`/`save()`.
 - Multi-level composition routes through nested parents (array → object); a child used before its parent falls back to direct storage; hydration restores routing through the persisted registry so children work before the parent component mounts.
 - Custom routers with their own path syntax (dot-notation dictionaries) are covered end-to-end, including no-op bailouts; remove+edit of the same id skips the edit; two ArraySection instances at different paths stay isolated.
 - Selector-aware subscriptions: transforms state and tracks `prevSelected`; default `'shallow'` equality bails out on structurally-identical selections; `'strict'` (`Object.is`) re-fires on new identity; custom comparator (prev, next) decides equality; `fireImmediately` reports `(current, undefined)`; lazy paths and post-purge re-subscriptions resolve from `initialState` (never raw `undefined`); routed children observe parent updates through the physical path; throwing listeners are isolated from other subscribers; low-level `(callback, name, path)` overload remains intact.
+- Multi-path subscriptions (`subscribeMany`): several addresses share one listener and one idempotent unsubscribe; microtask batching coalesces a flush into one call with at most one entry per address and drops changes reverted within that flush; `batch: 'sync'` delivers inline single-entry batches; `fireImmediately` reports every target with `previous: undefined`; duplicate targets are wired once; unresolvable/purged addresses read as `initialState`; a throwing listener is isolated and never reaches the hydration error boundary; watched paths defer a matching `purgeWhenUnused` until unsubscribed.
 - Optimistic rollback: single-path restore with identity-preserving no-op and idempotency; routed child restore through `ArraySection` parent via direct slice replacement (safe for command/action updaters); purge-safe ignoring of removed rows/paths (no resurrection); path-prefix restore across multiple sections and under global `''`/`'/'` prefix; capture immutability (capturing never mutates or notifies).
 - Observable hydration: initial status reflects persistence configuration (`'hydrated'` without it, `'idle'` with it); `hydrate()` transitions `'idle' → 'hydrating' → 'hydrated'` (including while a slow storage read is in flight); snapshot object is stable between transitions; `'quarantined'` carries the error and reports `isHydrated: true`; an unrecoverable repair-save failure lands on `'failed'` and rejects the hydrate promise; `subscribeHydration` unsubscribes cleanly.
 - `onQuarantine` lifecycle: invoked with `{ key, backupKey, rawData, error }` for corrupt JSON and throwing migrations; awaited when async; reports `backupKey: null` when backup write fails; skipped on healthy hydration; throwing callback is isolated so hydration resolves, the primary key is reset, and the session stays usable.

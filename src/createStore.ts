@@ -91,6 +91,60 @@ type SubscribeSelectorOptions<Selected> = {
     fireImmediately?: boolean;
 };
 
+/** One `(section, path)` address watched by `store.subscribeMany`. */
+type SubscribeManyTarget<SM extends Record<Name, Section>> = {
+    [N in keyof SM]: { name: N; path: Path };
+}[keyof SM];
+
+/**
+ * One change reported by `store.subscribeMany`.
+ *
+ * The union is discriminated by `name`, so narrowing on it
+ * (`if (change.name === 'BaseInfo')`) also narrows `current` / `previous` to
+ * that section's state type — consumers never need a cast.
+ */
+type SubscribeManyChange<SM extends Record<Name, Section>> = {
+    [N in keyof SM]: {
+        name: N;
+        path: Path;
+        /** The value AFTER the change (never raw `undefined`). */
+        current: SM[N]['initialState'];
+        /**
+         * The value that was last reported to this listener, or `undefined`
+         * for the very first report of that address (including the
+         * `fireImmediately` batch).
+         */
+        previous: SM[N]['initialState'] | undefined;
+    };
+}[keyof SM];
+
+/** Options accepted by `store.subscribeMany`. */
+type SubscribeManyOptions = {
+    /**
+     * How changes are delivered to the listener:
+     *
+     * - `'microtask'` (default): every change produced inside the same
+     *   synchronous flush is coalesced into ONE listener call on the next
+     *   microtask, at most one entry per `(name, path)` (the newest value
+     *   wins). A target that changes and changes back within the same flush
+     *   is dropped entirely. This is what turns the post-hydration
+     *   notification pass into a single call instead of one per path.
+     * - `'sync'`: the listener is invoked immediately, inside the dispatch
+     *   that produced the change, with a single-entry batch.
+     *
+     * @default 'microtask'
+     */
+    batch?: 'microtask' | 'sync';
+
+    /**
+     * When `true`, invoke the listener once SYNCHRONOUSLY at subscription
+     * time with one entry per target (`previous: undefined`).
+     *
+     * @default false
+     */
+    fireImmediately?: boolean;
+};
+
 /**
  * The default selector equality strategy (`'shallow'`): reference identity
  * via `Object.is`, falling back to a shallow key-by-key comparison for
@@ -853,6 +907,56 @@ type Store<SM extends Record<Name, Section> = Record<Name, Section>> = {
             prevSelected: Selected | undefined
         ) => void,
         options?: SubscribeSelectorOptions<Selected>
+    ): () => void;
+
+    /**
+     * Watches SEVERAL `(section, path)` addresses with ONE listener and ONE
+     * unsubscribe function — the multi-path counterpart of `subscribe`.
+     *
+     * The listener receives an array of changes. Entries are discriminated by
+     * `name`, so narrowing on it also narrows `current` / `previous` to that
+     * section's state type — no casts.
+     *
+     * By default changes are coalesced per microtask (see
+     * `SubscribeManyOptions.batch`): everything that happened in one
+     * synchronous flush arrives as a single call, with at most one entry per
+     * address. A change that is reverted inside the same flush is dropped.
+     *
+     * Semantics shared with the selector-aware `subscribe`:
+     * - the listener NEVER sees raw `undefined` for a valid section — a
+     *   lazily-uninitialized, purged, or unresolvable routed address is read
+     *   as the section's `initialState`;
+     * - subscribing lazily initializes each direct (non-routed) address, just
+     *   like a hook would;
+     * - routed children subscribe on their PHYSICAL parent path;
+     * - the listener is isolated: a throw is logged and never aborts other
+     *   subscribers or the store dispatch;
+     * - duplicate `(name, path)` targets are wired once (first wins);
+     * - the returned unsubscribe is idempotent and detaches every target.
+     *
+     * ⚠️ These are real subscriptions, so the watched paths count as "in use"
+     * and will defer a matching `purgeWhenUnused` until you unsubscribe.
+     *
+     * @example
+     * const unsubscribeAll = store.subscribeMany(
+     *     [
+     *         { name: 'BaseInfo', path: '/baseInfo' },
+     *         { name: 'Credential', path: '/credential' }
+     *     ],
+     *     changes => {
+     *         for (const change of changes) {
+     *             if (change.name === 'BaseInfo') {
+     *                 // change.current is typed as BaseInfo's state here
+     *             }
+     *         }
+     *     },
+     *     { fireImmediately: true }
+     * );
+     */
+    subscribeMany(
+        targets: readonly SubscribeManyTarget<SM>[],
+        listener: (changes: SubscribeManyChange<SM>[]) => void,
+        options?: SubscribeManyOptions
     ): () => void;
 
     /**
@@ -1644,6 +1748,182 @@ const createStore = <SM extends Record<Name, Section>>(
                         // chance to fire.
                         handleLastSubscriberLeft(store, name.toString(), path);
                     }
+                }
+            };
+        },
+
+        subscribeMany(
+            targets: readonly SubscribeManyTarget<SM>[],
+            listener: (changes: SubscribeManyChange<SM>[]) => void,
+            options?: SubscribeManyOptions
+        ): () => void {
+            if (typeof listener !== 'function') {
+                throw new Error(
+                    'YASM: subscribeMany requires (targets, listener).'
+                );
+            }
+
+            const batch = options?.batch ?? 'microtask';
+
+            // Wire each address exactly once; the first occurrence wins.
+            const seenTargetKeys = new Set<string>();
+            const uniqueTargets: { name: keyof SM; path: Path }[] = [];
+            for (const target of targets) {
+                const targetKey = subscriberKey(
+                    String(target.name),
+                    target.path
+                );
+                if (seenTargetKeys.has(targetKey)) {
+                    continue;
+                }
+                seenTargetKeys.add(targetKey);
+                uniqueTargets.push({ name: target.name, path: target.path });
+            }
+
+            type ManyEntry = {
+                name: keyof SM;
+                path: Path;
+                read: () => unknown;
+                /** Value last handed to the listener. */
+                delivered: unknown;
+            };
+
+            let unsubscribed = false;
+            let flushScheduled = false;
+
+            const entriesByKey = new Map<string, ManyEntry>();
+            const pending = new Map<string, SubscribeManyChange<SM>>();
+
+            const invokeIsolated = (changes: SubscribeManyChange<SM>[]) => {
+                try {
+                    listener(changes);
+                } catch (error) {
+                    console.error(
+                        'YASM: a subscribeMany listener threw an exception. The error is isolated so other subscribers are still notified.',
+                        error
+                    );
+                }
+            };
+
+            // Bookkeeping is settled BEFORE the listener runs, so a listener
+            // that dispatches an update cannot observe a stale `previous`.
+            const deliver = (
+                pairs: [string, SubscribeManyChange<SM>][]
+            ): void => {
+                for (const [key, change] of pairs) {
+                    const entry = entriesByKey.get(key);
+                    if (entry !== undefined) {
+                        entry.delivered = change.current;
+                    }
+                }
+                invokeIsolated(pairs.map(pair => pair[1]));
+            };
+
+            const flush = () => {
+                flushScheduled = false;
+                if (unsubscribed || pending.size === 0) {
+                    pending.clear();
+                    return;
+                }
+                const pairs = Array.from(pending.entries());
+                pending.clear();
+                deliver(pairs);
+            };
+
+            const enqueue = (
+                key: string,
+                change: SubscribeManyChange<SM>
+            ): void => {
+                if (batch === 'sync') {
+                    deliver([[key, change]]);
+                    return;
+                }
+                pending.set(key, change);
+                if (!flushScheduled) {
+                    flushScheduled = true;
+                    queueMicrotask(flush);
+                }
+            };
+
+            const unsubscribers = uniqueTargets.map(target => {
+                const key = subscriberKey(String(target.name), target.path);
+
+                // `init` lazily initializes direct addresses so the listener
+                // never observes a raw `undefined` for a valid section.
+                const record = init(store, target.name, target.path);
+
+                const read = (): unknown => {
+                    let value: unknown;
+                    try {
+                        value = record.getState();
+                    } catch {
+                        // A routed element that vanished (or never existed)
+                        // cannot be read — fall back to the section baseline.
+                        value = undefined;
+                    }
+                    return value === undefined
+                        ? store.sectionMap[target.name].initialState
+                        : value;
+                };
+
+                entriesByKey.set(key, {
+                    name: target.name,
+                    path: target.path,
+                    read,
+                    delivered: read()
+                });
+
+                // Subscribe on the ROUTED (physical) path via the memoized
+                // record, so the updater's per-path fan-out reaches us.
+                return record.subscribe(() => {
+                    if (unsubscribed) {
+                        return;
+                    }
+                    const entry = entriesByKey.get(key);
+                    if (entry === undefined) {
+                        return;
+                    }
+                    const current = entry.read();
+                    if (Object.is(current, entry.delivered)) {
+                        // Reverted inside the same flush (or a no-op ping,
+                        // e.g. the post-hydration notification pass).
+                        pending.delete(key);
+                        return;
+                    }
+                    // The heterogeneous per-section payload types make the
+                    // discriminated union unconstructable without a cast —
+                    // the same variance-safe widening `init` performs.
+                    enqueue(key, {
+                        name: entry.name,
+                        path: entry.path,
+                        current,
+                        previous: entry.delivered
+                    } as SubscribeManyChange<SM>);
+                });
+            });
+
+            if (options?.fireImmediately === true && entriesByKey.size > 0) {
+                invokeIsolated(
+                    Array.from(entriesByKey.values()).map(
+                        entry =>
+                            ({
+                                name: entry.name,
+                                path: entry.path,
+                                current: entry.delivered,
+                                previous: undefined
+                            }) as SubscribeManyChange<SM>
+                    )
+                );
+            }
+
+            return () => {
+                if (unsubscribed) {
+                    return;
+                }
+                unsubscribed = true;
+                pending.clear();
+                for (const unsubscribe of unsubscribers) {
+                    unsubscribe();
                 }
             };
         },
@@ -2658,7 +2938,10 @@ export type {
     HydrationResult,
     QuarantineInfo,
     SelectorEquality,
-    SubscribeSelectorOptions
+    SubscribeSelectorOptions,
+    SubscribeManyTarget,
+    SubscribeManyChange,
+    SubscribeManyOptions
 };
 export {
     createStore,

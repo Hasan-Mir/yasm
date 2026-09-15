@@ -42,6 +42,9 @@ export {
     type QuarantineInfo,
     type SelectorEquality,
     type SubscribeSelectorOptions,
+    type SubscribeManyTarget,
+    type SubscribeManyChange,
+    type SubscribeManyOptions,
     createStore,
     DEFAULT_PATH_BOUNDARY_CHARS
 } from './createStore';
