@@ -470,6 +470,7 @@ const route = <SM extends Record<Name, Section>>(
     /** Raw (throwing) resolver used by the updater's own guard. */
     getStateUnsafe: () => any;
     applyPayload: (payload: any) => any;
+    applyReplacement: (replacement: any) => any;
 } => {
     const state = store.state as Record<Name, Record<Path, any>>;
     const chain = getExtraRoutes(store, [name], path);
@@ -483,7 +484,8 @@ const route = <SM extends Record<Name, Section>>(
             applyPayload: payload =>
                 immer.produce(state[name][path], (draft: any) =>
                     store.sectionMap[name].updater(draft, payload)
-                )
+                ),
+            applyReplacement: (replacement: any) => replacement
         };
     }
 
@@ -555,6 +557,26 @@ const route = <SM extends Record<Name, Section>>(
         return update(0, state[routedName][routedPath]);
     };
 
+    const applyReplacement = (replacement: any): any => {
+        if (chain === undefined) {
+            return replacement;
+        }
+        const update = (stepIndex: number, subState: any): any => {
+            if (stepIndex === steps.length - 1) {
+                return replacement;
+            }
+            const pathQuery = steps[stepIndex + 1].path.slice(
+                steps[stepIndex].path.length
+            );
+            return store.sectionMap[steps[stepIndex].name].routing![
+                steps[stepIndex + 1].name
+            ].updateByPathQuery(subState, pathQuery, () =>
+                update(stepIndex + 1, undefined)
+            );
+        };
+        return update(0, state[routedName][routedPath]);
+    };
+
     return {
         routedName,
         routedPath,
@@ -562,7 +584,8 @@ const route = <SM extends Record<Name, Section>>(
         // Raw (throwing) resolver — used by the updater, whose own try/catch
         // turns resolution failures into safe no-ops.
         getStateUnsafe: resolveRoutedState,
-        applyPayload
+        applyPayload,
+        applyReplacement
     };
 };
 

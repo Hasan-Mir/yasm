@@ -5,9 +5,147 @@ import {
     type SnapshotMode
 } from './util';
 import { purgeYasmState, type PurgeOptions } from './purge';
+import { init, route } from './useYasmState';
 
 type Name = string;
 type Path = string;
+
+/**
+ * Observable hydration lifecycle of a store, consumed through
+ * `store.subscribeHydration()` / `store.getHydrationSnapshot()` and the
+ * `useHydration` hook.
+ *
+ * - `'idle'`        — persistence is configured but `hydrate()` was not called yet.
+ * - `'hydrating'`   — `hydrate()` is in flight (storage read + merge).
+ * - `'hydrated'`    — hydration succeeded normally.
+ * - `'quarantined'` — corrupted persisted data was backed up and the session
+ *                     booted fresh (see `onQuarantine`).
+ * - `'failed'`      — hydration hit an unrecoverable error (e.g. the repair
+ *                     save could not even write storage).
+ */
+type HydrationStatus =
+    'idle' | 'hydrating' | 'hydrated' | 'failed' | 'quarantined';
+
+/** Stable snapshot returned by `store.getHydrationSnapshot()` / `useHydration()`. */
+type HydrationResult = {
+    status: HydrationStatus;
+    /** Convenience flag: `true` when consumers may mount safely. */
+    isHydrated: boolean;
+    /** Set when the last transition was `'quarantined'` or `'failed'`. */
+    error?: unknown;
+};
+
+/** Structured payload handed to `PersistConfig.onQuarantine`. */
+type QuarantineInfo = {
+    /** The primary storage key whose payload was corrupted. */
+    key: string;
+    /**
+     * The quarantine backup key (`<key>_corrupted_backup_<timestamp>`), or
+     * `null` when the backup itself could not be written.
+     */
+    backupKey: string | null;
+    /** The raw payload read from storage, untouched. */
+    rawData: unknown;
+    /** The error that triggered the quarantine flow. */
+    error: unknown;
+};
+
+/**
+ * Equality strategy used by selector-aware subscriptions to decide whether a
+ * notification actually changed the selection:
+ *
+ * - `'shallow'` (default): `Object.is` on primitives, or a top-level
+ *   key-by-key comparison for objects/arrays (a selector that rebuilds its
+ *   result object on every call does not re-fire when every top-level value
+ *   is unchanged).
+ * - `'strict'`: `Object.is` — only reference/primitive identity wins.
+ * - custom: your own comparator.
+ */
+type SelectorEquality<Selected> =
+    | 'strict'
+    | 'shallow'
+    | ((prevSelected: Selected, nextSelected: Selected) => boolean);
+
+/** Options accepted by the selector-aware `store.subscribe` overload. */
+type SubscribeSelectorOptions<Selected> = {
+    /**
+     * The strategy used to decide whether the selected value has actually changed.
+     *
+     * - `'shallow'` (default): Compares top-level keys using `Object.is`.
+     * - `'strict'`: Reference equality only via `Object.is`.
+     * - `(prevSelected, nextSelected) => boolean`: A custom comparator receiving
+     *   the last-known value (`prevSelected`) and the freshly computed selection
+     *   (`nextSelected`). Return `true` to mark them equal and skip notifying
+     *   the listener, or `false` to fire the listener.
+     *
+     * @default 'shallow'
+     */
+    equality?: SelectorEquality<Selected>;
+
+    /**
+     * When `true`, invoke the listener once synchronously at subscription
+     * time with `(currentSelected, undefined)`.
+     *
+     * @default false
+     */
+    fireImmediately?: boolean;
+};
+
+/**
+ * The default selector equality strategy (`'shallow'`): reference identity
+ * via `Object.is`, falling back to a shallow key-by-key comparison for
+ * objects/arrays, with Date parity, prototype checks, and own-property guards.
+ */
+const shallowEqual = (a: unknown, b: unknown): boolean => {
+    if (Object.is(a, b)) {
+        return true;
+    }
+    if (
+        typeof a !== 'object' ||
+        typeof b !== 'object' ||
+        a === null ||
+        b === null
+    ) {
+        return false;
+    }
+
+    // 🛡️ Handles Date instances by timestamp value, and prevents Date vs {} false matches
+    if (a instanceof Date || b instanceof Date) {
+        return (
+            a instanceof Date &&
+            b instanceof Date &&
+            Object.is(a.getTime(), b.getTime())
+        );
+    }
+
+    // 🛡️ Guarantees identical prototype inheritance (separates [] vs {}, Map vs {}, etc.)
+    if (Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) {
+        return false;
+    }
+
+    const keysA = Object.keys(a);
+    const keysB = Object.keys(b);
+    if (keysA.length !== keysB.length) {
+        return false;
+    }
+
+    for (const key of keysA) {
+        // 🔒 Prevents prototype-chain resolution leak and verifies own property
+        if (!Object.prototype.hasOwnProperty.call(b, key)) {
+            return false;
+        }
+
+        if (
+            !Object.is(
+                (a as Record<string, unknown>)[key],
+                (b as Record<string, unknown>)[key]
+            )
+        ) {
+            return false;
+        }
+    }
+    return true;
+};
 
 /**
  * A mini-reducer for one section: receives the current state (an Immer
@@ -556,6 +694,19 @@ type PersistConfig<SM extends Record<Name, Section>> = {
     onHydrated?: () => void;
 
     /**
+     * Hook triggered when persisted data was corrupted (invalid JSON, a
+     * failing migration, a throwing `onBeforeHydrate` …) and YASM quarantined
+     * it: the raw payload was backed up under `<key>_corrupted_backup_<timestamp>`
+     * and the primary key is being reset to a clean snapshot. The session
+     * continues unlocked afterwards — hydration always resolves.
+     *
+     * Perfect for alerting error-tracking services (Sentry, …). The callback
+     * is isolated: if it throws, YASM logs it and still completes the
+     * quarantine reset and hydration. May be synchronous or asynchronous.
+     */
+    onQuarantine?: (info: QuarantineInfo) => void | Promise<void>;
+
+    /**
      * Options for normalizing the restored state against the `initialState` of each section.
      * Handles missing fields (added to schema), stale fields (removed from schema), and transient UI states.
      * Pass `false` to disable entirely.
@@ -659,8 +810,77 @@ type Store<SM extends Record<Name, Section> = Record<Name, Section>> = {
     /** The section map this store was created with. */
     sectionMap: SM;
 
-    /** Low-level subscription used by `useSyncExternalStore` (via `init`). */
+    /**
+     * Low-level subscription used by `useSyncExternalStore` (via `init`).
+     *
+     * Registers `callback` against the raw `(name, path)` pair and returns
+     * the unsubscribe function. Exactly one overload — fully backward
+     * compatible.
+     */
     subscribe(callback: () => void, name: keyof SM, path: Path): () => void;
+
+    /**
+     * Selector-aware subscription: evaluates `selector` against the state at
+     * `(name, path)` whenever that path is updated (or purged) and invokes
+     * `listener` — but only when the selected value actually changed
+     * according to `options.equality` (default `'shallow'`).
+     *
+     * The selector NEVER receives raw `undefined` for a valid section: a
+     * lazily-uninitialized or purged path is evaluated against the section's
+     * `initialState` instead. The listener is isolated — a throwing listener
+     * is logged and never aborts other subscribers or the store dispatch.
+     *
+     * @example
+     * store.subscribe(
+     *     'UserRow',
+     *     '/users[7]',
+     *     row => row.name,
+     *     (name, prevName) => console.info(`${prevName} → ${name}`)
+     * );
+     */
+    subscribe<N extends keyof SM, Selected>(
+        name: N,
+        path: Path,
+        selector: (state: SM[N]['initialState']) => Selected,
+        listener: (
+            selected: Selected,
+            prevSelected: Selected | undefined
+        ) => void,
+        options?: SubscribeSelectorOptions<Selected>
+    ): () => void;
+
+    /**
+     * Snapshots the state at `(name, path)` (resolved through routing) and
+     * returns a `rollback()` function that restores it. Restoring an
+     * unchanged value is a no-op (no notifications, no autosave); paths that
+     * were purged after capture are safely ignored; repeated `rollback()`
+     * calls are idempotent.
+     */
+    captureRollback<N extends keyof SM>(name: N, path: Path): () => void;
+
+    /**
+     * Snapshots every state entry whose path matches `pathPrefix`
+     * (segment-aware, same semantics as `snapshotByPrefix`) and returns a
+     * `rollback()` function that restores all of them at once.
+     */
+    captureRollback(pathPrefix: string): () => void;
+
+    /**
+     * Subscribes to hydration status transitions (see `HydrationStatus`).
+     * The callback fires after every transition and alongside normal
+     * subscriber isolation. Returns the unsubscribe function.
+     */
+    subscribeHydration(callback: () => void): () => void;
+
+    /** The current hydration status (see `HydrationStatus`). */
+    getHydrationStatus(): HydrationStatus;
+
+    /**
+     * A stable, memoized `HydrationResult` — the SAME object reference is
+     * returned until the status transitions, so it is safe to feed to
+     * `useSyncExternalStore` as a snapshot.
+     */
+    getHydrationSnapshot(): HydrationResult;
 
     /** Registered parent paths per routing section; persisted with the store so hydration can restore routing. */
     pathRegistry: Record<Name, Path[]>;
@@ -840,6 +1060,14 @@ const createStore = <SM extends Record<Name, Section>>(
     let isHydrated = false;
     let hydrationSuccess = false;
 
+    // Observable hydration lifecycle (see `HydrationStatus`). A store without
+    // persistence has nothing to wait for, so it boots straight into
+    // `'hydrated'` exactly like `isHydrated()` reports.
+    let hydrationStatus: HydrationStatus =
+        options?.persist !== undefined ? 'idle' : 'hydrated';
+    let hydrationError: unknown;
+    let hydrationSnapshot: HydrationResult;
+
     // Maintain executed migrations metadata in memory (not in state)
     let executedMigrations = new Set<string>();
 
@@ -977,6 +1205,44 @@ const createStore = <SM extends Record<Name, Section>>(
         }
     };
 
+    const buildHydrationSnapshot = (): HydrationResult => ({
+        status: hydrationStatus,
+        isHydrated:
+            hydrationStatus === 'hydrated' ||
+            hydrationStatus === 'quarantined' ||
+            options?.persist === undefined,
+        ...(hydrationError !== undefined ? { error: hydrationError } : {})
+    });
+
+    hydrationSnapshot = buildHydrationSnapshot();
+
+    const hydrationSubscribers = new Set<() => void>();
+
+    // 🔔 Publishes a hydration status transition (see `HydrationStatus`) to
+    // every `useHydration` / `store.subscribeHydration` subscriber. The
+    // snapshot object is replaced only on real transitions so
+    // `useSyncExternalStore` sees a stable reference between them.
+    const setHydrationStatus = (
+        status: HydrationStatus,
+        error?: unknown
+    ): void => {
+        const isChanged =
+            hydrationStatus !== status || hydrationError !== error;
+
+        hydrationStatus = status;
+        hydrationError = error !== undefined ? error : undefined;
+
+        if (!isChanged) {
+            return;
+        }
+
+        hydrationSnapshot = buildHydrationSnapshot();
+
+        for (const callback of Array.from(hydrationSubscribers)) {
+            safeInvokeSubscriber(callback);
+        }
+    };
+
     const notifyAllSubscribers = () => {
         for (const name of Object.keys(subscribers)) {
             const sectionSubscribers = (
@@ -998,6 +1264,60 @@ const createStore = <SM extends Record<Name, Section>>(
                     if (callback !== undefined) {
                         safeInvokeSubscriber(callback);
                     }
+                }
+            }
+        }
+    };
+
+    // 🔄 Restores a PHYSICAL (stored) `(name, path)` slot to a captured value
+    // and replicates the exact notification fan-out of the memoized updater
+    // (per-path subscribers + `SYMBOL_NOTIFY_CHANGE` → onStateChange/autosave).
+    //
+    // ⚠️ This bypasses the section updater ON PURPOSE: composed sections
+    // (`ArraySection`/`ObjectSection`, custom routers) accept *command* payloads
+    // (`{ order, addingItems, … }`), not raw state values — feeding a captured
+    // state object into such an updater is silently ignored. Physical slots are
+    // therefore restored by assignment, guarded by the same reference-equality
+    // fast path the updater uses (an unchanged restore is a true no-op, so no
+    // notifications fire and no autosave is scheduled).
+    const restorePhysicalState = (
+        store: Store<SM>,
+        name: keyof SM,
+        path: Path,
+        value: unknown
+    ): void => {
+        const sectionState = (
+            store.state as Record<Name, Record<Path, unknown>>
+        )[name as Name];
+
+        // Path was purged after capture (or never existed) — safely ignore so
+        // a rollback never resurrects destroyed state.
+        if (sectionState === undefined || sectionState[path] === undefined) {
+            return;
+        }
+
+        // Reference-equality no-op: nothing changed between capture and
+        // rollback → no notifications, no autosave churn.
+        if (Object.is(sectionState[path], value)) {
+            return;
+        }
+
+        sectionState[path] = value;
+
+        store[SYMBOL_NOTIFY_CHANGE]();
+
+        const pathSubscribers = (
+            store.subscribers as Record<
+                Name,
+                Record<Path, Record<number, () => void>>
+            >
+        )[name as Name]?.[path];
+
+        if (pathSubscribers !== undefined) {
+            for (const id of Object.keys(pathSubscribers)) {
+                const callback = pathSubscribers[id as unknown as number];
+                if (callback !== undefined) {
+                    safeInvokeSubscriber(callback);
                 }
             }
         }
@@ -1026,14 +1346,127 @@ const createStore = <SM extends Record<Name, Section>>(
         pendingPurges.push({ pathPrefix, match, pendingKeys });
     };
 
-    return {
+    const store: Store<SM> = {
         state: names.reduce((pre, name) => {
             pre[name] = {};
             return pre;
         }, {} as StateBySectionMap<SM>),
         subscribers,
         sectionMap,
-        subscribe(callback, name, path) {
+        subscribe(
+            callbackOrName: (() => void) | keyof SM,
+            nameOrPath?: keyof SM | Path,
+            pathOrSelector?: Path | ((state: any) => unknown),
+            listener?: (
+                selected: unknown,
+                prevSelected: unknown | undefined
+            ) => void,
+            options: SubscribeSelectorOptions<unknown> | undefined = undefined
+        ): () => void {
+            // ── Selector-aware subscription ─────────────────────────────────
+            if (typeof callbackOrName !== 'function') {
+                const name = callbackOrName as keyof SM;
+                const path = nameOrPath as Path;
+                const selector = pathOrSelector as (state: any) => unknown;
+                const onSelected = listener;
+
+                if (
+                    typeof selector !== 'function' ||
+                    typeof onSelected !== 'function'
+                ) {
+                    throw new Error(
+                        'YASM: selector-aware subscribe requires (name, path, selector, listener).'
+                    );
+                }
+
+                // `init` lazily initializes the path (direct sections) so the
+                // selector never evaluates a raw `undefined` for a valid
+                // section.
+                const record = init(store, name, path);
+
+                const equality = options?.equality ?? 'shallow';
+                const isEqual: (prev: unknown, next: unknown) => boolean =
+                    typeof equality === 'function'
+                        ? equality
+                        : equality === 'strict'
+                          ? Object.is
+                          : shallowEqual;
+
+                let lastSelected: unknown;
+                let hasLastSelected = false;
+                let unsubscribed = false;
+
+                const readSelection = (): unknown => {
+                    let state: unknown;
+                    try {
+                        state = record.getState();
+                    } catch {
+                        // A routed element that vanished (or never existed)
+                        // cannot be read — fall back to the section baseline.
+                        state = undefined;
+                    }
+                    if (state === undefined) {
+                        state = store.sectionMap[name].initialState;
+                    }
+                    return selector(state);
+                };
+
+                const invokeIsolated = (
+                    selected: unknown,
+                    prevSelected: unknown | undefined
+                ) => {
+                    try {
+                        onSelected(selected, prevSelected);
+                    } catch (error) {
+                        console.error(
+                            'YASM: a selector-aware subscriber listener threw an exception. The error is isolated so other subscribers are still notified.',
+                            error
+                        );
+                    }
+                };
+
+                const notify = () => {
+                    const selected = readSelection();
+
+                    // Bail out when the selection did not actually change.
+                    if (hasLastSelected && isEqual(lastSelected, selected)) {
+                        return;
+                    }
+
+                    const prevSelected: unknown | undefined = hasLastSelected
+                        ? lastSelected
+                        : undefined;
+
+                    lastSelected = selected;
+                    hasLastSelected = true;
+
+                    invokeIsolated(selected, prevSelected);
+                };
+
+                // Subscribe on the ROUTED (physical) path so the updater's
+                // per-path fan-out reaches this subscriber.
+                const rawUnsubscribe = record.subscribe(notify);
+
+                if (options?.fireImmediately === true) {
+                    // `hasLastSelected` is still false, so `notify` reports
+                    // `(currentSelected, undefined)` exactly as documented.
+                    notify();
+                }
+
+                return () => {
+                    if (unsubscribed) {
+                        return;
+                    }
+                    unsubscribed = true;
+                    rawUnsubscribe();
+                };
+            }
+
+            // ── Low-level subscription (backward compatible) ────────────────
+            const callback = callbackOrName as () => void;
+            const name = nameOrPath as keyof SM;
+            const path = pathOrSelector as Path;
+
             const sectionSubscribers = subscribers[name] as
                 Record<Path, Record<number, () => void>> | undefined;
 
@@ -1068,10 +1501,125 @@ const createStore = <SM extends Record<Name, Section>>(
                     // 🧹 The last subscriber of this path just left — give
                     // deferred purges waiting on it a chance to fire.
                     if (Object.keys(record).length === 0) {
-                        handleLastSubscriberLeft(this, name.toString(), path);
+                        handleLastSubscriberLeft(store, name.toString(), path);
                     }
                 }
             };
+        },
+
+        captureRollback(nameOrPrefix: keyof SM | string, maybePath?: Path) {
+            // ── Single (name, path) capture ─────────────────────────────────
+            if (maybePath !== undefined) {
+                const name = nameOrPrefix as keyof SM;
+                const path = maybePath;
+
+                // The memo record is keyed by path and holds heterogeneous
+                // section payload types; the widened `any` payload mirrors the
+                // identical variance-safe cast `init` itself performs.
+                const record = init(store, name, path) as {
+                    getState: () => SM[keyof SM]['initialState'];
+                    updater: (payload: any) => void;
+                };
+
+                let captured: SM[keyof SM]['initialState'] | undefined;
+                try {
+                    captured = record.getState();
+                } catch {
+                    // An unroutable (never-initialized) routed element has no
+                    // state to capture — fall back to the section baseline.
+                    captured = undefined;
+                }
+                if (captured === undefined) {
+                    captured = store.sectionMap[name].initialState;
+                }
+
+                const routeInfo = route(store, name as Name, path);
+                const isRouted =
+                    name !== routeInfo.routedName ||
+                    path !== routeInfo.routedPath;
+
+                if (isRouted) {
+                    return () => {
+                        try {
+                            // 🔒 Re-verify element still exists: throws if vanished mid-session
+                            const currentChildState =
+                                routeInfo.getStateUnsafe();
+                            if (Object.is(currentChildState, captured)) {
+                                return;
+                            }
+
+                            const nextParentState =
+                                routeInfo.applyReplacement(captured);
+                            restorePhysicalState(
+                                store,
+                                routeInfo.routedName as keyof SM,
+                                routeInfo.routedPath,
+                                nextParentState
+                            );
+                        } catch {
+                            // Backing element vanished since capture — safely ignore (no resurrection)
+                            return;
+                        }
+                    };
+                }
+
+                return () => {
+                    try {
+                        restorePhysicalState(store, name, path, captured);
+                    } catch {
+                        // Unknown section — safely ignore.
+                        return;
+                    }
+                };
+            }
+
+            // ── Path-prefix capture ─────────────────────────────────────────
+            // Section names are `Name = string`; the cast narrows the generic
+            // `keyof SM` union (which also admits `number | symbol`) to the
+            // prefix string `snapshotByPrefix` accepts.
+            const captured = snapshotByPrefix(store, nameOrPrefix as string, {
+                serialize: false
+            });
+
+            // Every entry in a snapshot is a PHYSICAL (stored) slot, so all
+            // restores go through `restorePhysicalState`.
+            return () => {
+                for (const sectionName of Object.keys(captured)) {
+                    const paths = captured[sectionName];
+                    if (paths === undefined) {
+                        continue;
+                    }
+
+                    for (const path of Object.keys(paths)) {
+                        try {
+                            restorePhysicalState(
+                                store,
+                                sectionName as keyof SM,
+                                path,
+                                paths[path]
+                            );
+                        } catch {
+                            // Unknown section — safely ignore.
+                            continue;
+                        }
+                    }
+                }
+            };
+        },
+
+        subscribeHydration(callback: () => void) {
+            hydrationSubscribers.add(callback);
+            return () => {
+                hydrationSubscribers.delete(callback);
+            };
+        },
+
+        getHydrationStatus() {
+            return hydrationStatus;
+        },
+
+        getHydrationSnapshot() {
+            return hydrationSnapshot;
         },
 
         pathRegistry: names.reduce(
@@ -1148,10 +1696,10 @@ const createStore = <SM extends Record<Name, Section>>(
             // persistence hooks must treat them as read-only.
             const omittedSections =
                 typeof p.omitSections === 'function'
-                    ? p.omitSections(this.state)
+                    ? p.omitSections(store.state)
                     : p.omitSections || [];
 
-            Object.entries(this.sectionMap).forEach(([key, section]) => {
+            Object.entries(store.sectionMap).forEach(([key, section]) => {
                 if (
                     section.persist === false &&
                     !omittedSections.includes(key as keyof SM)
@@ -1163,19 +1711,19 @@ const createStore = <SM extends Record<Name, Section>>(
             const stateToSave: Partial<StateBySectionMap<SM>> = {};
             const pathRegistryToSave: Partial<Record<Name, Path[]>> = {};
 
-            Object.keys(this.state).forEach(sectionKey => {
+            Object.keys(store.state).forEach(sectionKey => {
                 const key = sectionKey as keyof SM;
                 if (!omittedSections.includes(key)) {
-                    stateToSave[key] = { ...this.state[key] };
+                    stateToSave[key] = { ...store.state[key] };
                 }
             });
 
-            Object.keys(this.pathRegistry).forEach(sectionKey => {
+            Object.keys(store.pathRegistry).forEach(sectionKey => {
                 const key = sectionKey as Name;
                 if (!omittedSections.includes(key as keyof SM)) {
                     // Copy the array too: `init()` pushes new paths onto the
                     // live registry, which must not leak into this snapshot.
-                    pathRegistryToSave[key] = [...this.pathRegistry[key]];
+                    pathRegistryToSave[key] = [...store.pathRegistry[key]];
                 }
             });
 
@@ -1247,7 +1795,7 @@ const createStore = <SM extends Record<Name, Section>>(
                 : [pathPrefix];
 
             for (const prefix of prefixes) {
-                schedulePurgeWhenUnused(this, prefix, options?.match);
+                schedulePurgeWhenUnused(store, prefix, options?.match);
             }
         },
 
@@ -1265,13 +1813,13 @@ const createStore = <SM extends Record<Name, Section>>(
                 Array.isArray(pathPrefixOrOptions)
             ) {
                 return snapshotByPrefix(
-                    this,
+                    store,
                     pathPrefixOrOptions,
                     maybeOptions
                 );
             }
 
-            return snapshotByPrefix(this, pathPrefixOrOptions);
+            return snapshotByPrefix(store, pathPrefixOrOptions);
         },
 
         isHydrated() {
@@ -1286,15 +1834,24 @@ const createStore = <SM extends Record<Name, Section>>(
                 return hydrationPromise;
             }
 
-            hydrationPromise = (async () => {
-                const p = options?.persist;
-                let isStateChangedDuringHydration = false;
+            const p = options?.persist;
+            if (!p || !p.key || !p.storage) {
+                isHydrated = true;
+                hydrationSuccess = true;
+                setHydrationStatus('hydrated');
+                hydrationPromise = Promise.resolve();
+                return hydrationPromise;
+            }
 
-                if (!p || !p.key || !p.storage) {
-                    isHydrated = true;
-                    hydrationSuccess = true;
-                    return;
-                }
+            const { key, storage } = p;
+
+            // 🔔 Consumers mount only when the status lands on `'hydrated'`,
+            // `'quarantined'`, or (for stores without persistence) the
+            // initial `'hydrated'` value.
+            setHydrationStatus('hydrating');
+
+            hydrationPromise = (async () => {
+                let isStateChangedDuringHydration = false;
 
                 let rawData: string | null | unknown = null;
                 let persistedPendingPurges: {
@@ -1303,7 +1860,7 @@ const createStore = <SM extends Record<Name, Section>>(
                 }[] = [];
 
                 try {
-                    rawData = await p.storage.getItem(p.key);
+                    rawData = await storage.getItem(key);
                     if (rawData) {
                         const parsed =
                             typeof rawData === 'string'
@@ -1406,7 +1963,7 @@ const createStore = <SM extends Record<Name, Section>>(
 
                         // 3. Remove stale sections natively
                         Object.keys(parsed.state).forEach(sectionName => {
-                            if (!(sectionName in this.sectionMap)) {
+                            if (!(sectionName in store.sectionMap)) {
                                 delete parsed.state[sectionName];
                                 isStateChangedDuringHydration = true;
                             }
@@ -1414,7 +1971,7 @@ const createStore = <SM extends Record<Name, Section>>(
 
                         Object.keys(parsed.pathRegistry).forEach(
                             sectionName => {
-                                if (!(sectionName in this.pathRegistry)) {
+                                if (!(sectionName in store.pathRegistry)) {
                                     delete parsed.pathRegistry[sectionName];
                                     isStateChangedDuringHydration = true;
                                 }
@@ -1586,7 +2143,7 @@ const createStore = <SM extends Record<Name, Section>>(
                             };
 
                             Object.keys(parsed.state).forEach(sectionName => {
-                                const section = this.sectionMap[sectionName];
+                                const section = store.sectionMap[sectionName];
                                 const storedSection = parsed.state[sectionName];
                                 const initial = section.initialState;
 
@@ -1645,8 +2202,8 @@ const createStore = <SM extends Record<Name, Section>>(
                         // 🔒 (Deep merge paths to prevent overwriting paths created natively during hydration)
                         Object.keys(parsed.state).forEach(sectionName => {
                             const key = sectionName as keyof SM;
-                            this.state[key] = {
-                                ...this.state[key],
+                            store.state[key] = {
+                                ...store.state[key],
                                 ...(parsed.state as any)[key]
                             };
                         });
@@ -1656,12 +2213,12 @@ const createStore = <SM extends Record<Name, Section>>(
                                 const key = sectionName as Name;
                                 // 🔒 Ensure uniqueness when merging path registries
                                 const existingPaths = new Set(
-                                    this.pathRegistry[key] || []
+                                    store.pathRegistry[key] || []
                                 );
                                 (parsed.pathRegistry as any)[key].forEach(
                                     (p: string) => existingPaths.add(p)
                                 );
-                                this.pathRegistry[key] =
+                                store.pathRegistry[key] =
                                     Array.from(existingPaths);
                             }
                         );
@@ -1674,7 +2231,7 @@ const createStore = <SM extends Record<Name, Section>>(
                         // state, and pre-purge snapshots self-heal.
                         if (persistedPendingPurges.length > 0) {
                             for (const pending of persistedPendingPurges) {
-                                this.purgeWhenUnused(
+                                store.purgeWhenUnused(
                                     pending.pathPrefix,
                                     pending.match === 'startsWith'
                                         ? { match: 'startsWith' }
@@ -1722,28 +2279,58 @@ const createStore = <SM extends Record<Name, Section>>(
                         error
                     );
 
+                    // 🔔 Entered the quarantine flow: the persisted payload is
+                    // corrupted and will be backed up (if readable) while the
+                    // primary key is reset to a clean snapshot.
+                    setHydrationStatus('quarantined', error);
+
                     // 🛡️ Quarantine Strategy: Backing up corrupted data
-                    if (rawData !== null && p.key && p.storage) {
+                    if (rawData !== null && key && storage) {
+                        let backupKey: string | null = null;
                         try {
                             const timestamp = new Date()
                                 .toISOString()
                                 .replace(/[:.]/g, '-');
 
-                            const backupKey = `${p.key}_corrupted_backup_${timestamp}`;
+                            const createdBackupKey = `${key}_corrupted_backup_${timestamp}`;
                             const dataToBackup =
                                 typeof rawData === 'string'
                                     ? rawData
                                     : JSON.stringify(rawData);
 
-                            await p.storage.setItem(backupKey, dataToBackup);
+                            await storage.setItem(
+                                createdBackupKey,
+                                dataToBackup
+                            );
+                            backupKey = createdBackupKey;
                             console.warn(
-                                `YASM: Corrupted state backed up to "${backupKey}". Starting fresh.`
+                                `YASM: Corrupted state backed up to "${createdBackupKey}". Starting fresh.`
                             );
                         } catch (backupError) {
                             console.error(
                                 'YASM: Failed to create backup of corrupted state.',
                                 backupError
                             );
+                        }
+
+                        // 🪝 Structured quarantine notification for the host
+                        // application (Sentry, analytics, …). Isolated: a
+                        // throwing `onQuarantine` must never prevent YASM
+                        // from resetting storage and completing hydration.
+                        if (p.onQuarantine) {
+                            try {
+                                await p.onQuarantine({
+                                    key,
+                                    backupKey,
+                                    rawData,
+                                    error
+                                });
+                            } catch (quarantineCallbackError) {
+                                console.error(
+                                    'YASM: onQuarantine callback failed.',
+                                    quarantineCallbackError
+                                );
+                            }
                         }
                     }
 
@@ -1760,7 +2347,23 @@ const createStore = <SM extends Record<Name, Section>>(
 
                 // 7. If state was modified during hydration, persist it back to storage
                 if (isStateChangedDuringHydration) {
-                    await this.save();
+                    try {
+                        await store.save();
+                    } catch (error) {
+                        console.error(
+                            'YASM: hydration failed irrecoverably — the repair-save could not write storage.',
+                            error
+                        );
+                        setHydrationStatus('failed', error);
+                        throw error;
+                    }
+                }
+
+                // Normal completion. The catch block already published
+                // `'quarantined'` (or `'failed'` above) — only an in-flight
+                // hydration may land on `'hydrated'`.
+                if (hydrationStatus === 'hydrating') {
+                    setHydrationStatus('hydrated');
                 }
 
                 if (p.onHydrated) {
@@ -1776,7 +2379,7 @@ const createStore = <SM extends Record<Name, Section>>(
         },
 
         [SYMBOL_NOTIFY_FORCED_UNSUBSCRIBE](name: Name, path: Path) {
-            handleLastSubscriberLeft(this, name.toString(), path);
+            handleLastSubscriberLeft(store, name.toString(), path);
         },
 
         [SYMBOL_NOTIFY_CHANGE]: async function () {
@@ -1819,7 +2422,7 @@ const createStore = <SM extends Record<Name, Section>>(
             debounceTimer = setTimeout(() => {
                 const task = async () => {
                     try {
-                        await this.save();
+                        await store.save();
                     } catch (error) {
                         console.error(
                             'YASM: Background auto-save failed.',
@@ -1842,6 +2445,8 @@ const createStore = <SM extends Record<Name, Section>>(
             }, ms);
         }
     };
+
+    return store;
 };
 
 export type {
@@ -1863,7 +2468,12 @@ export type {
     PersistConfig,
     StateMigration,
     PersistedSnapshot,
-    YasmPersistenceAdapter
+    YasmPersistenceAdapter,
+    HydrationStatus,
+    HydrationResult,
+    QuarantineInfo,
+    SelectorEquality,
+    SubscribeSelectorOptions
 };
 export {
     createStore,

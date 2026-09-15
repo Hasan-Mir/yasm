@@ -1,5 +1,6 @@
 export { YasmContext } from './Context';
 export { useYasmState, useYasmStateUpdater } from './useYasmState';
+export { useHydration } from './useHydration';
 export { usePurgeYasmState } from './usePurgeYasmState';
 export { usePurgeWhenUnused } from './usePurgeWhenUnused';
 export { purgeYasmState, type PurgeOptions } from './purge';
@@ -36,6 +37,11 @@ export {
     type StateMigration,
     type PersistedSnapshot,
     type YasmPersistenceAdapter,
+    type HydrationStatus,
+    type HydrationResult,
+    type QuarantineInfo,
+    type SelectorEquality,
+    type SubscribeSelectorOptions,
     createStore,
     DEFAULT_PATH_BOUNDARY_CHARS
 } from './createStore';

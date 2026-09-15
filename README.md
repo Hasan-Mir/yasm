@@ -12,6 +12,10 @@ YASM organizes state as a grid of **Sections × Paths**. A _section_ defines the
 - 🧹 **Purgeable state**: Free all state under a path prefix in one call: `purge('/tabs/1')`. Segment-aware matching guarantees `/tabs/1` never touches `/tabs/10`.
 - 🧬 **Composable sections**: `arraySectionGenerator` and `objectSectionGenerator` build parent sections whose children are addressable through **path routing**: `useYasmState('Row', '/table[3]')` reads/writes the row _inside_ the table state immutably, with parent subscribers notified.
 - ⚡ **Precise re-renders**: Components subscribe per `(section, path)` and can narrow further with selectors. No top-down re-render cascades.
+- 📡 **Selector-aware subscriptions**: `store.subscribe(name, path, selector, listener, options?)` evaluates a selector on every update and invokes the listener only when the selection *actually changed* (`'shallow'` by default, `'strict'`, or a custom comparator) — the listener never receives raw `undefined` for a valid section.
+- 🛡️ **Observable hydration**: `useHydration()` (or `store.subscribeHydration()`) tracks `'idle' → 'hydrating' → 'hydrated' | 'quarantined' | 'failed'` so splash screens need no `useEffect` + `.finally(...)` boilerplate.
+- 🪝 **Quarantine callback**: `persist.onQuarantine` reports corrupted payloads (with the backup key and error) to error-tracking services — isolated, so it can never block the quarantine reset.
+- ↩️ **Optimistic rollback**: `store.captureRollback(name, path)` / `store.captureRollback(pathPrefix)` snapshot state and restore it on API rejection — idempotent, purge-safe, and a no-op when nothing changed.
 - ✍️ **Reducer-like updaters with Immer**: Write mutable code, get immutable updates. Updaters returning an unchanged state produce **no** notification churn (reference equality is preserved).
 - 🦥 **Lazy initialization**: State is created on first use, optionally with `overrideInitialState` (object or function form).
 - 🎯 **Payload creators**: `updater(state => payload)` reads the latest state at dispatch time, avoiding stale closures.
@@ -325,6 +329,62 @@ The setter cache is keyed by the updater function — and YASM keeps the updater
 >
 > With the flag enabled, the assignment above becomes a **compile-time error**, while fields that are _genuinely_ nullable (`age?: number | undefined`) remain fully assignable. This is the single most important tsconfig flag for YASM users.
 
+---
+
+### Reducer-Style Sections (Action / Command Pattern)
+
+While utility generators like `mergeUpdaterGenerator` provide convenient shallow merging, YASM section updaters are fundamentally mini-reducers powered by Immer. You are not limited to object payloads—a section updater can accept any structured action or command, matching the familiar `useReducer` or Redux Toolkit pattern:
+
+```ts
+type CounterState = {
+    count: number;
+    step: number;
+};
+
+type CounterAction =
+    | { type: 'INCREMENT' }
+    | { type: 'DECREMENT' }
+    | { type: 'SET_STEP'; step: number }
+    | { type: 'RESET' };
+
+const counterSection: Section<CounterState, CounterAction> = {
+    initialState: { count: 0, step: 1 },
+    updater: (draft, action) => {
+        switch (action.type) {
+            case 'INCREMENT':
+                draft.count += draft.step;
+                break;
+            case 'DECREMENT':
+                draft.count -= draft.step;
+                break;
+            case 'SET_STEP':
+                draft.step = action.step;
+                break;
+            case 'RESET':
+                draft.count = 0;
+                draft.step = 1;
+                break;
+        }
+    }
+};
+
+```
+
+Using it inside components via `useYasmState` or `useYasmStateUpdater` remains completely identical:
+
+```tsx
+const [state, dispatch] = useYasmState('Counter', '/tabs/1/counter');
+
+// Dispatching actions:
+dispatch({ type: 'INCREMENT' });
+dispatch({ type: 'SET_STEP', step: 5 });
+
+// Optimistic Rollback (store.captureRollback) also restores this cleanly 
+// without relying on or clobbering your action types.
+```
+
+---
+
 ### Selectors & Overrides
 
 ```ts
@@ -337,6 +397,31 @@ const [state, update] = useYasmState('Counter', '/c', {
 ```
 
 > ⚠️ **Warning**: Selectors must return **stable** values for unchanged state (primitives, or references stored in state). A selector that builds a new object/array on every call will cause infinite re-renders under `useSyncExternalStore`.
+
+### Selector-Aware Subscriptions (`store.subscribe`)
+
+The low-level `store.subscribe(callback, name, path)` remains fully supported (it backs `useSyncExternalStore`). On top of it, YASM offers a **selector-aware overload** for imperative listeners outside React:
+
+```ts
+store.subscribe(
+    'UserRow',
+    '/users[7]',
+    row => row.name, // evaluate the same way a hook selector would
+    (name, prevName) => console.info(`${prevName} → ${name}`),
+    { equality: 'shallow', fireImmediately: false }
+);
+```
+
+- The selector is evaluated whenever `(name, path)` is notified (update or purge), memoized, and re-fired **only when the selection actually changed**:
+  - `'shallow'` (default) — `Object.is`, falling back to a top-level key-by-key comparison. A selector that rebuilds its result object on every call does **not** re-fire when every top-level value is unchanged.
+  - `'strict'` — `Object.is` only (a fresh object identity always re-fires).
+  - custom — `(prev, next) => boolean`, giving you full control (e.g. compare a **parity** or a sorted key instead of the raw value).
+- **No raw `undefined`**: lazily-uninitialized or purged paths are evaluated against the section's `initialState`, never a raw `undefined` for a valid section. Routed children that vanished resolve to their last-known value (same convention as the hooks).
+- `fireImmediately: true` invokes the listener once at subscription time with `(currentSelected, undefined)`.
+- Listener exceptions are **isolated** (logged, never propagated) — a throwing listener cannot break the store dispatch or other subscribers.
+- Returns an `unsubscribe` function that removes the registration cleanly.
+
+> 💡 Use this for table-cell observers, analytics, cross-component coordination, or imperative code outside the React tree. Inside React, `useYasmState` with a selector is still the ergonomic choice — it wraps the exact same subscription machinery.
 
 ---
 
@@ -619,6 +704,43 @@ usePurgeRemovedRows(
 
 ---
 
+## ↩️ Optimistic Rollback (`captureRollback`)
+
+Optimistic UI updates mutate the store **before** the API call settles. When the call rejects, you need the exact pre-mutation state back. `store.captureRollback` removes the manual bookkeeping:
+
+```ts
+// 1. Snapshot the row(s) BEFORE the optimistic update
+const rollback = store.captureRollback('UserRow', '/users[7]');
+
+// 2. Apply the optimistic patch
+updateRow(path, { saving: true });
+await saveRowRemote({ ... });
+
+// 3. On rejection — restore in one call:
+try {
+    await saveRowRemote({ ... });
+} catch (error) {
+    rollback(); // row is back to its exact captured value
+}
+```
+
+Two overloads:
+
+| Call                                              | Captures                                                        |
+| :------------------------------------------------ | :-------------------------------------------------------------- |
+| `captureRollback(name, path)`                     | The value at that path, resolved through routing (`ArraySection`/`ObjectSection` children included). |
+| `captureRollback(pathPrefix)`                     | Every state entry matching the segment-aware prefix (same semantics as `snapshotByPrefix`).         |
+
+Guarantees:
+
+- **Immutable snapshot** — the captured values are the store's own (frozen in dev) references; capturing never mutates anything.
+- **No-op when unchanged** — rolling back over state that did not change fires **zero** notifications and schedules **no** autosave (reference-equality fast path).
+- **Purge-safe** — paths destroyed after capture are silently skipped, never resurrected, and never throw.
+- **Idempotent** — calling `rollback()` repeatedly is harmless; the second call is a pure no-op.
+- **Notifies** — real restores trigger the same change fan-out as any update (`onStateChange`, autosave, per-path subscribers).
+
+---
+
 ## 💾 Persistence
 
 Persistence is configured in the second argument to `createStore`. YASM saves `store.state`, `store.pathRegistry`, and a small `metadata` record (used for migration bookkeeping). The registry is required to restore composition/routing correctly.
@@ -720,7 +842,75 @@ export const StoreProvider = ({ children }: { children: ReactNode }) => {
 >
 > You can also gate rendering programmatically with `store.isHydrated()` — it returns `true` once hydration finished, or right away when no persistence is configured.
 >
-> `hydrate()` always resolves (even on failure). If the stored snapshot is corrupted, YASM backs it up to a quarantine key and starts fresh — see **Corrupted Snapshot Handling** below.
+> `hydrate()` resolves upon successful merge or when recovering from corrupted snapshots via quarantine (the session boots fresh and status lands on `'quarantined'`). It rejects **only** if an irrecoverable storage failure occurs during the repair-save (e.g. storage quota exceeded or disk write failure), transitioning the status to `'failed'` and setting the snapshot `error`. See **Corrupted Snapshot Handling** below.
+
+### Gating on Hydration: `useHydration`
+
+The boilerplate `ready` state + `useEffect(() => { store.hydrate().finally(...) }, [])` collapses into one reactive hook. `useHydration` is driven by `useSyncExternalStore` over the store's **hydration status**, so the component re-renders the moment the status transitions:
+
+```tsx
+import { ReactNode } from 'react';
+import { useHydration, YasmContext } from '@mrnafisia/yasm';
+import { store } from './store';
+
+// Option 1: Pass the store explicitly when calling useHydration at the root provider level
+const StoreProvider = ({ children }: { children: ReactNode }) => {
+    const { status } = useHydration(store);
+
+    return (
+        <YasmContext.Provider value={store}>
+            {status === 'hydrated' || status === 'quarantined'
+                ? children
+                : <SplashScreen status={status}/>}
+        </YasmContext.Provider>
+    );
+};
+```
+
+> ⚠️ **Context Consumption Warning**:
+> By default, `useHydration()` reads the store from React context (`useContext(YasmContext)`).
+> If you invoke `useHydration()` without arguments **inside the very component that renders `<YasmContext.Provider>`**, it will throw an error:
+> ```text
+> YASM: no store was found in the React context. Wrap your component tree in <YasmContext.Provider value="{store}"> or pass the store explicitly to useHydration(store).
+> ```
+> To avoid this, either:
+> 1. Pass the store explicitly: `useHydration(store)` (as shown in the example above).
+> 2. Or split your tree and call `useHydration()` inside a child component rendered beneath `<YasmContext.Provider>`:
+>
+> ```tsx
+> const StoreProvider = ({ children }: { children: ReactNode }) => (
+>     <YasmContext.Provider value="{store}">
+>         <HydrationGate>{children}</HydrationGate>
+>     </YasmContext.Provider>
+> );
+>
+> const HydrationGate = ({ children }: { children: ReactNode }) => {
+>     const { status } = useHydration(); // ✅ Safe: reads store from parent YasmContext.Provider
+>     return status === 'hydrated' || status === 'quarantined'
+>         ? <>{children}</>
+>         : <SplashScreen status="{status}"/>;
+> };
+> ```
+
+The statuses:
+
+| Status         | Meaning                                                                                                        |
+| :------------- | :------------------------------------------------------------------------------------------------------------- |
+| `'idle'`       | Persistence is configured but `hydrate()` was not called yet.                                                  |
+| `'hydrating'`  | `hydrate()` is in flight (storage read + merge).                                                               |
+| `'hydrated'`   | Hydration succeeded normally. Consumers may mount.                                                             |
+| `'quarantined'`| Corrupted data was backed up and the session booted fresh — the app is usable (`isHydrated: true`).            |
+| `'failed'`     | Unrecoverable failure (e.g. even the repair-save could not write storage). `error` carries the cause.          |
+
+```ts
+type HydrationResult = {
+    status: 'idle' | 'hydrating' | 'hydrated' | 'failed' | 'quarantined';
+    isHydrated: boolean;
+    error?: unknown;
+};
+```
+
+A store **without persistence is `'hydrated'` from the start** (nothing to wait for), exactly like `store.isHydrated()`. The hook reads the store from context and accepts an explicit store argument too: `useHydration(store)`. For imperative code, the same machinery is available on the store: `store.subscribeHydration(cb)` + `store.getHydrationSnapshot()` (a stable object reference until the next transition) + `store.getHydrationStatus()`.
 
 ### LocalForage / IndexedDB Adapter
 
@@ -761,6 +951,37 @@ If anything goes wrong while reading or repairing the stored snapshot — invali
 ```
 
 ⚠️ Quarantine backups accumulate over time. Prune old `<key>_corrupted_backup_*` entries yourself if your users hit repeated corruption.
+
+#### Notifying your error tracker: `onQuarantine`
+
+To observe quarantines without digging through console logs, add the optional `persist.onQuarantine` callback:
+
+```ts
+persist: {
+    key: 'yasmState',
+    storage,
+
+    // Runs AFTER the corrupt payload was backed up (if readable), always
+    // before the primary key is reset. Perfect for Sentry & friends.
+    onQuarantine: ({ key, backupKey, rawData, error }) => {
+        sentry.captureException(error, {
+            extra: { key, backupKey, rawData: String(rawData) }
+        });
+    }
+}
+```
+
+```ts
+type QuarantineInfo = {
+    key: string;                    // the primary storage key
+    backupKey: string | null;       // '<key>_corrupted_backup_<timestamp>', or
+                                    // null when the backup write itself failed
+    rawData: unknown;               // the untouched corrupt payload
+    error: unknown;                 // the error that triggered the quarantine
+};
+```
+
+`onQuarantine` may be synchronous or asynchronous and is **isolated** — if it throws, YASM logs the failure, completes the quarantine reset, and hydration still resolves. Hydration also lands on the `'quarantined'` status (see `useHydration` below), so you can react in the store as well as the app layer.
 
 ### Manual Save & Autosave
 
@@ -1280,11 +1501,18 @@ const useValueState = <T>(path: string, initial: T) => {
 | `createStore(sectionMap, options?)`               | function | Creates the store. Options include debugging, persistence, path boundaries, serialization, and `onStateChange`.                                                                   |
 | `store.hydrate()`                                 | method   | Loads and merges state + path registry from the configured persistence adapter. Await it before mounting consumers (see the hydration chapter).                                   |
 | `store.isHydrated()`                              | method   | `true` once hydration finished — or immediately when no persistence is configured. Use it to gate rendering.                                                                      |
+| `store.getHydrationStatus()`                      | method   | The current hydration status: `'idle' \| 'hydrating' \| 'hydrated' \| 'failed' \| 'quarantined'`.                                                                                 |
+| `store.getHydrationSnapshot()`                    | method   | A stable `HydrationResult` (same object until the status transitions).                                                                                                            |
+| `store.subscribeHydration(cb)`                    | method   | Subscribe to hydration status transitions; returns the unsubscribe function.                                                                                                      |
 | `store.save()`                                    | method   | Immediately saves through built-in and/or custom persistence.                                                                                                                     |
 | `store.purgeWhenUnused(path, options?)`           | method   | Lifecycle-safe purge: executes when the last matching subscriber leaves (or immediately if none); persisted and drained on hydration. `path` is a prefix or an array of prefixes. |
+| `store.captureRollback(name, path)`               | method   | Snapshot one path (routing-aware) and return a `rollback()` that restores it — idempotent, purge-safe, no-op when unchanged.                                                       |
+| `store.captureRollback(pathPrefix)`               | method   | Snapshot every state entry under a segment-aware prefix and return a `rollback()` restoring all of them at once.                                                                   |
 | `YasmContext`                                     | context  | Provide the store to your tree.                                                                                                                                                   |
+| `useHydration(store?)`                            | hook     | Returns the current `HydrationResult` and re-renders on transitions — the reactive replacement for `ready` + `hydrate().finally(...)`.                                            |
 | `useYasmState(name, path, selectorOrOptions?)`    | hook     | Returns `[state, updater]`. Options: `selector`, `overrideInitialState`.                                                                                                          |
 | `useYasmStateUpdater(name, path)`                 | hook     | Write-only access: returns just the updater; never subscribes or re-renders.                                                                                                      |
+| `store.subscribe(cb \| name, path, …)`            | method   | Raw `(callback, name, path)` for `useSyncExternalStore`, or selector-aware `(name, path, selector, listener, options?)` with `equality` (`'shallow'`/`'strict'`/custom) and `fireImmediately`. |
 | `usePurgeYasmState()`                             | hook     | Returns `purge(pathPrefix \| pathPrefix[], options?)`.                                                                                                                            |
 | `usePurgeWhenUnused()`                            | hook     | Lifecycle-safe purge: fires when the last matching subscriber leaves (or immediately if none). Accepts one prefix or an array of prefixes.                                        |
 | `purgeYasmState(store, path, options?)`           | function | Pure purge — usable outside React. `path` is a prefix or an array of prefixes.                                                                                                    |
@@ -1304,7 +1532,7 @@ const useValueState = <T>(path: string, initial: T) => {
 
 ```bash
 npm run test        # node:test via tsx
-npm run typecheck   # tsc -p tsconfig.test.json
+npm run checktype   # tsc -p tsconfig.test.json
 ```
 
 ---
@@ -1312,3 +1540,4 @@ npm run typecheck   # tsc -p tsconfig.test.json
 ## 📄 License
 
 MIT © MRNafisiA
+

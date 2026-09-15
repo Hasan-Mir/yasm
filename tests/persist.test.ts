@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { createStore, Section } from '../src/createStore';
+import {
+    Section,
+    createStore,
+    type HydrationStatus,
+    type QuarantineInfo
+} from '../src/createStore';
 import { mergeUpdaterGenerator, arraySectionGenerator } from '../src/util';
 import { init } from '../src/useYasmState';
 import { purgeYasmState } from '../src/purge';
@@ -1686,4 +1691,396 @@ test('persistence: normalize-hook sections do not force a repair-save when nothi
 
     const afterHydrate = await storage.getItem('test-key');
     assert.equal(afterHydrate, beforeSave);
+});
+
+// --- onQuarantine lifecycle callback ---
+
+test('persistence: onQuarantine receives the corrupt payload, backup key and error', async () => {
+    const storage = createMockStorage();
+    const badData = '{ invalid json!!!';
+    await storage.setItem('test-key', badData);
+
+    let info: QuarantineInfo | undefined;
+    const store = createStore(
+        { Dummy: dummySection },
+        {
+            persist: {
+                key: 'test-key',
+                storage,
+                onQuarantine: received => {
+                    info = received;
+                }
+            }
+        }
+    );
+
+    await captureConsole('error', async () => {
+        await captureConsole('warn', async () => {
+            await store.hydrate();
+        });
+    });
+
+    assert.ok(info, 'onQuarantine must be called on corruption');
+    assert.equal(info!.key, 'test-key');
+    assert.ok(
+        info!.backupKey !== null &&
+            info!.backupKey.startsWith('test-key_corrupted_backup_')
+    );
+    assert.equal(info!.rawData, badData);
+    assert.match(String(info!.error), /JSON/i);
+
+    // The backup key really contains the untouched corrupt payload, and the
+    // primary key was reset to a clean snapshot.
+    assert.equal(await storage.getItem(info!.backupKey!), badData);
+    const mainRaw = JSON.parse((await storage.getItem('test-key')) as string);
+    assert.deepEqual(mainRaw.state, { Dummy: {} });
+});
+
+test('persistence: onQuarantine fires when a migration throws', async () => {
+    const storage = createMockStorage();
+    const originalData = JSON.stringify({
+        state: { One: { '/x': { count: 7, text: '', isLoading: false } } },
+        pathRegistry: {}
+    });
+    await storage.setItem('test-key', originalData);
+
+    let info: QuarantineInfo | undefined;
+    const store = createStore(
+        { One: dummySection },
+        {
+            persist: {
+                key: 'test-key',
+                storage,
+                migrations: {
+                    One: [
+                        {
+                            id: 'm1',
+                            migrate: () => {
+                                throw new Error('migration failed');
+                            }
+                        }
+                    ]
+                },
+                onQuarantine: received => {
+                    info = received;
+                }
+            }
+        }
+    );
+
+    await captureConsole('error', async () => {
+        await captureConsole('warn', async () => {
+            await store.hydrate();
+        });
+    });
+
+    assert.ok(info);
+    assert.equal(info!.rawData, originalData);
+    assert.match(String(info!.error), /migration failed/);
+    assert.equal(await storage.getItem(info!.backupKey!), originalData);
+});
+
+test('persistence: a throwing onQuarantine does not break hydration or the quarantine reset', async () => {
+    const storage = createMockStorage();
+    await storage.setItem('test-key', '{ broken');
+
+    let calls = 0;
+    const store = createStore(
+        { Dummy: dummySection },
+        {
+            persist: {
+                key: 'test-key',
+                storage,
+                onQuarantine: () => {
+                    calls++;
+                    throw new Error('sentry is down');
+                }
+            }
+        }
+    );
+
+    const errors = await captureConsole('error', async () => {
+        await captureConsole('warn', async () => {
+            await assert.doesNotReject(async () => store.hydrate());
+        });
+    });
+
+    assert.equal(calls, 1);
+    assert.ok(
+        errors.some(msg =>
+            String(msg).includes('onQuarantine callback failed')
+        )
+    );
+    assert.equal(store.getHydrationStatus(), 'quarantined');
+
+    // The primary key was STILL reset and the session stays usable.
+    const mainRaw = JSON.parse((await storage.getItem('test-key')) as string);
+    assert.deepEqual(mainRaw.state, { Dummy: {} });
+    init(store, 'Dummy', '/a');
+    store.memo.Dummy['/a'].updater({ count: 42 });
+    await store.save();
+});
+
+test('persistence: an async onQuarantine is awaited before hydration completes', async () => {
+    const storage = createMockStorage();
+    await storage.setItem('test-key', '{ broken');
+
+    let finished = false;
+    const store = createStore(
+        { Dummy: dummySection },
+        {
+            persist: {
+                key: 'test-key',
+                storage,
+                onQuarantine: async () => {
+                    await Promise.resolve();
+                    finished = true;
+                }
+            }
+        }
+    );
+
+    await captureConsole('error', async () => {
+        await captureConsole('warn', async () => {
+            await store.hydrate();
+        });
+    });
+
+    assert.equal(
+        finished,
+        true,
+        'hydration must await the async onQuarantine callback'
+    );
+});
+
+test('persistence: onQuarantine is NOT called on a healthy hydration', async () => {
+    const storage = createMockStorage();
+    await storage.setItem(
+        'test-key',
+        JSON.stringify({ state: { Dummy: {} }, pathRegistry: {} })
+    );
+
+    let calls = 0;
+    const store = createStore(
+        { Dummy: dummySection },
+        {
+            persist: {
+                key: 'test-key',
+                storage,
+                onQuarantine: () => {
+                    calls++;
+                }
+            }
+        }
+    );
+
+    await store.hydrate();
+    assert.equal(calls, 0);
+});
+
+test('persistence: onQuarantine reports backupKey null when the backup write fails', async () => {
+    const storage = createMockStorage();
+    await storage.setItem('test-key', '{ broken');
+    const originalSetItem = storage.setItem.bind(storage);
+    storage.setItem = async (key: string, value: string) => {
+        if (key.startsWith('test-key_corrupted_backup_')) {
+            throw new Error('disk full');
+        }
+        return originalSetItem(key, value);
+    };
+
+    let info: QuarantineInfo | undefined;
+    const store = createStore(
+        { Dummy: dummySection },
+        {
+            persist: {
+                key: 'test-key',
+                storage,
+                onQuarantine: received => {
+                    info = received;
+                }
+            }
+        }
+    );
+
+    await captureConsole('error', async () => {
+        await captureConsole('warn', async () => {
+            await assert.doesNotReject(async () => store.hydrate());
+        });
+    });
+
+    assert.ok(info);
+    assert.equal(info!.backupKey, null);
+    assert.equal(store.getHydrationStatus(), 'quarantined');
+});
+
+// --- Observable hydration lifecycle ---
+
+test('hydration status: reflects whether persistence is configured', () => {
+    const noPersistStore = createStore({ Dummy: dummySection });
+    assert.equal(noPersistStore.getHydrationStatus(), 'hydrated');
+    assert.equal(noPersistStore.getHydrationSnapshot().isHydrated, true);
+    assert.equal(noPersistStore.isHydrated(), true);
+
+    const persistStore = createStore(
+        { Dummy: dummySection },
+        { persist: { key: 'k', storage: createMockStorage() } }
+    );
+    assert.equal(persistStore.getHydrationStatus(), 'idle');
+    assert.equal(persistStore.getHydrationSnapshot().isHydrated, false);
+    assert.equal(persistStore.isHydrated(), false);
+});
+
+test('hydration status: hydrate() transitions idle → hydrating → hydrated', async () => {
+    const storage = createMockStorage();
+    const store = createStore(
+        { Dummy: dummySection },
+        { persist: { key: 'test-key', storage } }
+    );
+
+    const transitions: HydrationStatus[] = [];
+    store.subscribeHydration(() =>
+        transitions.push(store.getHydrationStatus())
+    );
+
+    const hydration = store.hydrate();
+    assert.equal(store.getHydrationStatus(), 'hydrating');
+
+    await hydration;
+    assert.equal(store.getHydrationStatus(), 'hydrated');
+    assert.deepEqual(transitions, ['hydrating', 'hydrated']);
+    assert.equal(store.getHydrationSnapshot().isHydrated, true);
+});
+
+test('hydration status: stays hydrating while a slow storage read is in flight', async () => {
+    const storage = createMockStorage();
+    let releaseGet: () => void = () => undefined;
+    const gate = new Promise<void>(resolve => {
+        releaseGet = resolve;
+    });
+
+    const store = createStore(
+        { Dummy: dummySection },
+        {
+            persist: {
+                key: 'test-key',
+                storage: {
+                    ...storage,
+                    getItem: async () => {
+                        await gate;
+                        return null;
+                    }
+                }
+            }
+        }
+    );
+
+    const hydration = store.hydrate();
+    assert.equal(store.getHydrationStatus(), 'hydrating');
+
+    releaseGet();
+    await hydration;
+    assert.equal(store.getHydrationStatus(), 'hydrated');
+});
+
+test('hydration status: the snapshot object is stable between transitions', async () => {
+    const storage = createMockStorage();
+    const store = createStore(
+        { Dummy: dummySection },
+        { persist: { key: 'test-key', storage } }
+    );
+
+    const idle = store.getHydrationSnapshot();
+    assert.equal(store.getHydrationSnapshot(), idle);
+
+    await store.hydrate();
+    const hydrated = store.getHydrationSnapshot();
+    assert.notEqual(hydrated, idle);
+    assert.equal(store.getHydrationSnapshot(), hydrated);
+});
+
+test('hydration status: a corrupt payload lands on quarantined with the error attached', async () => {
+    const storage = createMockStorage();
+    await storage.setItem('test-key', '{ nope');
+
+    const store = createStore(
+        { Dummy: dummySection },
+        { persist: { key: 'test-key', storage } }
+    );
+
+    const transitions: HydrationStatus[] = [];
+    store.subscribeHydration(() =>
+        transitions.push(store.getHydrationStatus())
+    );
+
+    await captureConsole('error', async () => {
+        await captureConsole('warn', async () => {
+            await assert.doesNotReject(async () => store.hydrate());
+        });
+    });
+
+    assert.equal(store.getHydrationStatus(), 'quarantined');
+    assert.deepEqual(transitions, ['hydrating', 'quarantined']);
+
+    const snapshot = store.getHydrationSnapshot();
+    assert.equal(snapshot.isHydrated, true, 'the app boots normally');
+    assert.ok(snapshot.error !== undefined);
+});
+
+test('hydration status: an unrecoverable repair-save failure lands on failed', async () => {
+    const storage = createMockStorage();
+    await storage.setItem('test-key', '{ nope');
+
+    const store = createStore(
+        { Dummy: dummySection },
+        {
+            persist: {
+                key: 'test-key',
+                storage,
+                // Throws synchronously while save() builds its snapshot — the
+                // repair-save after the quarantine reset therefore rejects.
+                omitSections: () => {
+                    throw new Error('omitSections exploded');
+                }
+            }
+        }
+    );
+
+    let rejection: unknown = undefined;
+    await captureConsole('error', async () => {
+        await captureConsole('warn', async () => {
+            try {
+                await store.hydrate();
+            } catch (error) {
+                rejection = error;
+            }
+        });
+    });
+
+    assert.ok(rejection !== undefined, 'hydrate() must reject');
+    assert.match(String(rejection), /omitSections exploded/);
+
+    assert.equal(store.getHydrationStatus(), 'failed');
+    const snapshot = store.getHydrationSnapshot();
+    assert.equal(snapshot.isHydrated, false);
+    assert.ok(snapshot.error !== undefined);
+});
+
+test('hydration status: subscribeHydration unsubscribes per callback', async () => {
+    const storage = createMockStorage();
+    const store = createStore(
+        { Dummy: dummySection },
+        { persist: { key: 'test-key', storage } }
+    );
+
+    let a = 0;
+    let b = 0;
+    store.subscribeHydration(() => a++);
+    const unsubscribeB = store.subscribeHydration(() => b++);
+    unsubscribeB();
+
+    await store.hydrate();
+
+    assert.equal(a, 2, 'the subscribed callback sees both transitions');
+    assert.equal(b, 0, 'the unsubscribed callback is never called');
 });

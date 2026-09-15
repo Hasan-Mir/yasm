@@ -2,6 +2,7 @@ import { act, render, screen } from '@testing-library/react';
 import { YasmContext } from '../../src/Context';
 import { Section, createStore } from '../../src/createStore';
 import { useYasmState } from '../../src/useYasmState';
+import { useHydration } from '../../src/useHydration';
 import { mergeUpdaterGenerator } from '../../src/util';
 
 type State = { value: number; text: string };
@@ -157,4 +158,137 @@ test('a reader mounted after hydrate() completed reads persisted state directly'
 
     // init() must reuse the hydrated record instead of resetting to initial
     expect(screen.getByTestId('tab-value')).toHaveTextContent('7');
+});
+
+test('useHydration: a store without persistence is hydrated from the start', () => {
+    const store = createStore({ State: section });
+
+    const Watcher = () => {
+        const { status, isHydrated } = useHydration();
+        return (
+            <>
+                <span data-testid="h-status">{status}</span>
+                <span data-testid="h-ready">{isHydrated ? 'yes' : 'no'}</span>
+            </>
+        );
+    };
+
+    render(
+        <YasmContext.Provider value={store}>
+            <Watcher />
+        </YasmContext.Provider>
+    );
+
+    expect(screen.getByTestId('h-status')).toHaveTextContent('hydrated');
+    expect(screen.getByTestId('h-ready')).toHaveTextContent('yes');
+});
+
+test('useHydration: accepts an explicit store without a context provider', () => {
+    const store = createStore({ State: section });
+
+    const Watcher = () => {
+        const { status } = useHydration(store);
+        return <span data-testid="h-status">{status}</span>;
+    };
+
+    render(<Watcher />);
+
+    expect(screen.getByTestId('h-status')).toHaveTextContent('hydrated');
+});
+
+test('useHydration: re-renders across idle → hydrating → hydrated', async () => {
+    let releaseGet: () => void = () => undefined;
+    const gate = new Promise<void>(resolve => {
+        releaseGet = resolve;
+    });
+
+    const storage = createMockStorage();
+    const store = createStore(
+        { State: section },
+        {
+            persist: {
+                key: 'tabs',
+                storage: {
+                    ...storage,
+                    getItem: async () => {
+                        await gate;
+                        return null;
+                    }
+                }
+            }
+        }
+    );
+
+    const Watcher = () => {
+        const { status } = useHydration();
+        return <span data-testid="h-status">{status}</span>;
+    };
+
+    render(
+        <YasmContext.Provider value={store}>
+            <Watcher />
+        </YasmContext.Provider>
+    );
+
+    // Persistence is configured but hydrate() has not run yet.
+    expect(screen.getByTestId('h-status')).toHaveTextContent('idle');
+
+    let hydrationPromise: Promise<void>;
+    act(() => {
+        hydrationPromise = store.hydrate();
+    });
+
+    // The transition to `'hydrating'` is synchronous and the watcher already
+    // re-rendered.
+    expect(screen.getByTestId('h-status')).toHaveTextContent('hydrating');
+
+    await act(async () => {
+        releaseGet();
+        await hydrationPromise;
+    });
+
+    expect(screen.getByTestId('h-status')).toHaveTextContent('hydrated');
+});
+
+test('useHydration: surfaces the quarantined status after a corrupt payload', async () => {
+    const storage = createMockStorage();
+    await storage.setItem('tabs', '{ bad json');
+
+    const store = createStore(
+        { State: section },
+        { persist: { key: 'tabs', storage } }
+    );
+
+    // The quarantine flow logs through console.error/warn — silence it.
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    const Watcher = () => {
+        const { status, isHydrated } = useHydration();
+        return (
+            <>
+                <span data-testid="h-status">{status}</span>
+                <span data-testid="h-ready">{isHydrated ? 'yes' : 'no'}</span>
+            </>
+        );
+    };
+
+    try {
+        render(
+            <YasmContext.Provider value={store}>
+                <Watcher />
+            </YasmContext.Provider>
+        );
+        expect(screen.getByTestId('h-status')).toHaveTextContent('idle');
+
+        await act(async () => {
+            await store.hydrate();
+        });
+
+        expect(screen.getByTestId('h-status')).toHaveTextContent('quarantined');
+        expect(screen.getByTestId('h-ready')).toHaveTextContent('yes');
+    } finally {
+        vi.mocked(console.error).mockRestore();
+        vi.mocked(console.warn).mockRestore();
+    }
 });
