@@ -423,3 +423,36 @@ test('a throwing subscriber on one path does not block sibling notifications', (
     unsubBad();
     unsubGood();
 });
+
+test('purging a routed child LOGICAL path clears only the memo record, leaving the parent row intact', async () => {
+    const store = makeStore();
+    init(store, 'Table', '/t');
+    store.memo.Table['/t'].updater({
+        addingItems: [{ id: 3, partialState: { title: 'row3' } }],
+        order: [3]
+    });
+    init(store, 'Row', '/t[3]');
+
+    // Routed children keep their subscriptions under the PHYSICAL parent
+    // path, so nothing is warned about or detached here (see the routed
+    // paths note in purge.ts).
+    const warnings = await captureWarnings(() =>
+        purgeYasmState(store, '/t[3]')
+    );
+    assert.deepEqual(warnings, []);
+
+    // The child's memo record is gone...
+    assert.equal(store.memo.Row['/t[3]'], undefined);
+    // ...but the parent's physical data is untouched: a logical purge cannot
+    // surgically remove one element from the parent structure.
+    assert.equal(store.state.Table['/t'].map[3].title, 'row3');
+    assert.deepEqual(store.state.Table['/t'].order, [3]);
+    assert.deepEqual(store.pathRegistry.Table, ['/t']);
+
+    // A fresh child hook re-resolves against the surviving parent state.
+    const reinitialized = init(store, 'Row', '/t[3]');
+    assert.deepEqual(reinitialized.getState(), {
+        title: 'row3',
+        done: false
+    });
+});

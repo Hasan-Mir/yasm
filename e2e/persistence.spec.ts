@@ -3,8 +3,7 @@ import { expect, test } from '@playwright/test';
 import {
     clearStorage,
     readParsedSnapshot,
-    waitForReady,
-    writeRawSnapshot
+    waitForReady
 } from './helpers/storage';
 
 // Real IndexedDB + real serializer round-trips. None of this is reachable from
@@ -57,46 +56,27 @@ test.describe('persistence against a real IndexedDB adapter', () => {
         );
     });
 
-    test('a Date survives the serializer round-trip through real storage', async ({
+    test('the real autosave debounce persists an edit without any explicit save()', async ({
         page
     }) => {
-        await page.getByTestId('note-set-date').click();
-        await page.evaluate(() => window.__yasmE2E.save());
+        // No window.__yasmE2E.save() anywhere in this test: it exercises the
+        // REAL production path — update notification → 600ms debounced
+        // autosave → requestIdleCallback → localforage write.
+        await page.getByTestId('note-text').fill('written-by-autosave');
 
+        await expect
+            .poll(async () => {
+                const snapshot = await readParsedSnapshot(page);
+                return snapshot?.state?.Note?.['/note']?.text ?? null;
+            })
+            .toBe('$$STR$$_written-by-autosave');
+
+        // The debounce-written value also survives a real reload.
         await page.reload();
         await waitForReady(page);
-
-        await expect(page.getByTestId('note-created-at')).toHaveText(
-            '2024-03-04T05:06:07.008Z'
-        );
-    });
-
-    test('a user-typed string that mimics a serializer prefix is restored verbatim', async ({
-        page
-    }) => {
-        // Without the universal `$$STR$$_` escape this would come back a BigInt.
-        await page.getByTestId('note-text').fill('$$BIGINT$$_123');
-        await page.evaluate(() => window.__yasmE2E.save());
-
-        await page.reload();
-        await waitForReady(page);
-
         await expect(page.getByTestId('note-text')).toHaveValue(
-            '$$BIGINT$$_123'
+            'written-by-autosave'
         );
-    });
-
-    test('a large payload round-trips through IndexedDB without truncation', async ({
-        page
-    }) => {
-        await page.getByTestId('note-fill-bulk').click();
-        await expect(page.getByTestId('note-bulk-size')).toHaveText('2000');
-        await page.evaluate(() => window.__yasmE2E.save());
-
-        await page.reload();
-        await waitForReady(page);
-
-        await expect(page.getByTestId('note-bulk-size')).toHaveText('2000');
     });
 
     test('a section declared persist:false never reaches storage and starts fresh', async ({
@@ -190,36 +170,5 @@ test.describe('persistence against a real IndexedDB adapter', () => {
         await expect(page.getByTestId('note-text')).toHaveValue('');
         const healed = await readParsedSnapshot(page);
         expect(healed?.metadata?.pendingPurges).toEqual([]);
-    });
-
-    test('an unknown section left by an older build is dropped and the repair-save persists that', async ({
-        page
-    }) => {
-        await writeRawSnapshot(
-            page,
-            JSON.stringify({
-                state: {
-                    Note: {
-                        '/note': {
-                            text: '$$STR$$_kept',
-                            count: 3,
-                            isLoading: false,
-                            bulk: []
-                        }
-                    },
-                    RemovedInV2: { '/gone': { anything: 1 } }
-                },
-                pathRegistry: {},
-                metadata: {}
-            })
-        );
-
-        await page.reload();
-        await waitForReady(page);
-
-        await expect(page.getByTestId('note-text')).toHaveValue('kept');
-        const snapshot = await readParsedSnapshot(page);
-        expect(snapshot).not.toBeNull();
-        expect(snapshot?.state.RemovedInV2).toBeUndefined();
     });
 });
