@@ -307,28 +307,106 @@ setCount(prev => prev + 1);
 
 The setter cache is keyed by the updater function — and YASM keeps the updater reference stable per `(section, path)` — so the same setter reference survives re-renders and remounts, and is safe to use in dependency arrays.
 
-> ⚠️ **Enable `exactOptionalPropertyTypes` — seriously!**
+> ⚠️ **Optional Properties, ****`undefined`****, and ****`exactOptionalPropertyTypes`**
 >
-> Every partial-payload API in YASM (`mergeUpdaterGenerator` payloads, `overrideInitialState`, ArraySection `partialState`, and ObjectSection child payloads) is typed with **optional properties**. Under TypeScript's default behavior, an optional property also accepts an **explicit `undefined`** — so this compiles without any complaint:
+> YASM's partial-update APIs use optional properties to mean “leave this field unchanged”. TypeScript's default behavior also allows an explicit `undefined` for those properties:
 >
 > ```ts
-> // age is typed `number` — and we just silently made it undefined!
 > updateState({ age: undefined });
 > ```
 >
-> At runtime the merge overwrites `age` with `undefined`, breaking every invariant that expects a number. The fix is one compiler flag (which — surprisingly — is **not** part of `strict`):
+> If `age` is a `number`, this can accidentally overwrite a valid value with `undefined`.
+>
+> The TypeScript option `exactOptionalPropertyTypes` prevents this:
 >
 > ```json
-> // tsconfig.json
 > {
 >     "compilerOptions": {
->         "strict": true,
 >         "exactOptionalPropertyTypes": true
 >     }
 > }
 > ```
 >
-> With the flag enabled, the assignment above becomes a **compile-time error**, while fields that are _genuinely_ nullable (`age?: number | undefined`) remain fully assignable. This is the single most important tsconfig flag for YASM users.
+> However, this option is not part of `strict`, and enabling it globally can be impractical in existing applications because third-party declaration files may rely on the looser optional-property behavior. In particular, large UI libraries can produce many compatibility errors.
+>
+> For that reason, YASM does not require `exactOptionalPropertyTypes` to be enabled.
+>
+> #### Recommended state design
+>
+> When a field can intentionally have “no value”, prefer a required property with an explicit `null` value:
+>
+> ```ts
+> type UserState = {
+>     age: number | null;
+>     selectedId: string | null;
+> };
+> ```
+>
+> rather than:
+>
+> ```ts
+> type UserState = {
+>     age?: number;
+>     selectedId?: string;
+> };
+> ```
+
+> or:
+>
+> ```ts
+> type UserState = {
+>     age: number | undefined;
+>     selectedId: string | undefined;
+> };
+> ```
+>
+> This makes the state invariant explicit: the property always exists, and its “empty” value is `null`, never `undefined`.
+>
+> Do not use `age?: number | null` as a substitute. With `exactOptionalPropertyTypes` disabled, that still permits an explicit `undefined`.
+>
+> This convention also makes state checks unambiguous:
+>
+> ```ts
+> if (state.age === null) {
+>     // no age
+> }
+> ```
+>
+> instead of having to account for both `null` and `undefined`.
+>
+> #### Important limitation
+>
+> Using `null` does not completely replace `exactOptionalPropertyTypes`.
+>
+> YASM's partial payloads still intentionally use optional properties:
+>
+> ```ts
+> updateState({ age: 42 });
+> updateState({ selectedId: null });
+> ```
+>
+> When `exactOptionalPropertyTypes` is disabled, TypeScript can still allow:
+>
+> ```ts
+> updateState({ age: undefined });
+> ```
+>
+> even when the underlying state is:
+>
+> ```ts
+> type UserState = {
+>     age: number | null;
+> };
+> ```
+>
+> Therefore:
+>
+> * Prefer required `T | null` properties in YASM state when “no value” is meaningful.
+> * Avoid using `undefined` as a valid state value unless it is explicitly part of the state model.
+> * Do not rely on `null` alone as a complete replacement for `exactOptionalPropertyTypes`.
+> * If your project can safely enable `exactOptionalPropertyTypes`, it remains the strongest compile-time protection for YASM's optional/partial APIs.
+>
+> When `undefined` can enter state through external data, migrations, persistence, or other untyped boundaries, normalize or validate that data before it becomes application state.
 
 ---
 
@@ -1647,7 +1725,7 @@ const useValueState = <T>(path: string, initial: T) => {
     When the callback form is used, matching entries are tagged `YASM (Filtered)` in the console (with a colored badge) so you can tell them apart from the plain full-logging output.
 
 - 🧊 **Direct mutations throw in development**: when a path is first initialized, YASM deep-freezes its state (development only, `NODE_ENV !== 'production'`). Mutating state outside of updaters fails fast with a `TypeError` instead of silently corrupting the store; the check is skipped in production builds for performance.
-- ⚠️ **Enable `exactOptionalPropertyTypes` in your tsconfig** — otherwise `updateState({ age: undefined })` compiles even when `age: number` and silently corrupts your state. See the warning under **Updaters & Payload Creators**.
+- ⚠️ `exactOptionalPropertyTypes` is strongly recommended when your project can enable it safely. If your application depends on libraries whose typings are not compatible with the option, prefer required state properties such as `value: T | null` over optional state properties such as `value?: T`. This improves state invariants, but does not completely replace the compiler option for YASM's partial-update APIs.
 - 🚫 **A payload that is a function is always treated as a payload creator**—never store bare functions as payloads.
 
 ---
