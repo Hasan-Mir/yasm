@@ -284,3 +284,99 @@ test('selector-aware subscribe: shallow equality notifies when Date values chang
     store.memo.Session['/session'].updater({ loginTime: new Date(2000) });
     assert.equal(fires, 1);
 });
+
+test('selector-aware subscribe: first unchanged update does not fire when fireImmediately is false', () => {
+    const store = makeStore();
+
+    init(store, 'Counter', '/a');
+
+    const record = store.memo.Counter['/a'];
+
+    let fires = 0;
+
+    store.subscribe(
+        'Counter',
+        '/a',
+        state => state.count,
+        () => fires++
+    );
+
+    record.updater({ label: 'changed' });
+
+    assert.equal(fires, 0);
+
+    record.updater({ count: 1 });
+
+    assert.equal(fires, 1);
+});
+
+test('selector-aware subscribe: shallow equality handles Map, Set, and RegExp values', () => {
+    type State = {
+        map: Map<string, number>;
+        set: Set<string>;
+        regex: RegExp;
+    };
+
+    const section: Section<State, State> = {
+        initialState: {
+            map: new Map(),
+            set: new Set(),
+            regex: /a/
+        },
+        // Full-value replacement updater: never reads the draft, so Map/Set
+        // values are not routed through an Immer draft (which would require
+        // the MapSet plugin).
+        updater: (_state, payload) => payload
+    };
+
+    const store = createStore({ State: section });
+
+    init(store, 'State', '/a');
+
+    const record = store.memo.State['/a'];
+
+    let mapFires = 0;
+    let setFires = 0;
+    let regexFires = 0;
+
+    store.subscribe(
+        'State',
+        '/a',
+        state => state.map,
+        () => mapFires++
+    );
+
+    store.subscribe(
+        'State',
+        '/a',
+        state => state.set,
+        () => setFires++
+    );
+
+    store.subscribe(
+        'State',
+        '/a',
+        state => state.regex,
+        () => regexFires++
+    );
+
+    record.updater({
+        map: new Map([['a', 1]]),
+        set: new Set(['a']),
+        regex: /b/g
+    });
+
+    assert.equal(mapFires, 1);
+    assert.equal(setFires, 1);
+    assert.equal(regexFires, 1);
+
+    record.updater({
+        map: new Map([['a', 1]]),
+        set: new Set(['a']),
+        regex: /b/g
+    });
+
+    assert.equal(mapFires, 1);
+    assert.equal(setFires, 1);
+    assert.equal(regexFires, 1);
+});

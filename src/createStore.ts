@@ -5,7 +5,7 @@ import {
     type SnapshotMode
 } from './util';
 import { purgeYasmState, type PurgeOptions } from './purge';
-import { init, route } from './useYasmState';
+import { init, RebindRoutingResult, route } from './useYasmState';
 import { cloneYasmSubtree, type CloneSubtreeOptions } from './clone';
 
 type Name = string;
@@ -173,6 +173,56 @@ const shallowEqual = (a: unknown, b: unknown): boolean => {
         );
     }
 
+    if (a instanceof Set || b instanceof Set) {
+        if (!(a instanceof Set) || !(b instanceof Set)) {
+            return false;
+        }
+
+        if (a.size !== b.size) {
+            return false;
+        }
+
+        for (const value of Array.from(a)) {
+            if (!b.has(value)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    if (a instanceof Map || b instanceof Map) {
+        if (!(a instanceof Map) || !(b instanceof Map)) {
+            return false;
+        }
+
+        if (a.size !== b.size) {
+            return false;
+        }
+
+        for (const entry of Array.from(a)) {
+            const key = entry[0];
+            const value = entry[1];
+            if (!b.has(key) || !Object.is(b.get(key), value)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    if (a instanceof RegExp || b instanceof RegExp) {
+        if (!(a instanceof RegExp) || !(b instanceof RegExp)) {
+            return false;
+        }
+
+        return (
+            a.source === b.source &&
+            a.flags === b.flags &&
+            Object.is(a.lastIndex, b.lastIndex)
+        );
+    }
+
     // 🛡️ Guarantees identical prototype inheritance (separates [] vs {}, Map vs {}, etc.)
     if (Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) {
         return false;
@@ -282,6 +332,7 @@ type Memo<SM extends Record<Name, Section>> = {
             subscribe: (callback: () => void) => () => void;
             getState: () => SM[name]['initialState'];
             updater: (payload: PayloadAndPayloadCreator<SM, name>) => void;
+            rebindRouting?: () => RebindRoutingResult | undefined;
         }
     >;
 };
@@ -1129,6 +1180,14 @@ type Store<SM extends Record<Name, Section> = Record<Name, Section>> = {
         debugOptions: Required<ResolvedDebugOptions>;
     };
 
+const DEFAULT_SERIALIZER = (
+    _object: Record<string, unknown>,
+    _key: string,
+    value: unknown
+) => value;
+
+const DEFAULT_DESERIALIZER = (_key: string, value: unknown) => value;
+
 /** The default path segment boundaries: `'/'`, `'['` and `'.'`. */
 const DEFAULT_PATH_BOUNDARY_CHARS = ['/', '[', '.'];
 
@@ -1372,28 +1431,31 @@ const createStore = <SM extends Record<Name, Section>>(
     };
 
     const firePendingPurge = (store: Store<SM>, entry: PendingPurge) => {
-        // 🔒 Re-verify against LIVE subscribers before destroying: paths that
-        // were revived (e.g. a deleted row restored by a refetch) or newly
-        // created under the prefix after scheduling must never be wiped —
-        // re-snapshot and keep waiting instead.
+        // 🔒 Re-verify against LIVE subscribers before scheduling destruction:
+        // paths that were revived (e.g. a deleted row restored by a refetch) or
+        // newly created under the prefix after scheduling must never be wiped —
+        // keep the pending purge armed instead.
         const liveKeys = collectSubscribedKeys(entry.pathPrefix, entry.match);
+
         if (liveKeys.size > 0) {
             entry.pendingKeys = liveKeys;
             return;
         }
 
-        // Bookkeeping is settled synchronously so snapshots taken right after
-        // the last unsubscribe no longer carry the marker…
-        pendingPurges = pendingPurges.filter(pending => pending !== entry);
-
-        // …but the destruction itself is deferred to the next task and
-        // re-verified at execution time. React can detach and re-attach a
-        // subtree within one synchronous flush (StrictMode's double effect
-        // invocation, concurrent transitions), momentarily dropping every
-        // subscription — firing inline here would wipe state for components
-        // that are about to remount. Waiting one task bridges those gaps;
-        // if subscribers came back in the meantime, the entry re-arms itself.
+        // Keep the pending marker alive during the deferred window so snapshots
+        // taken before the purge executes still contain enough information to
+        // purge the state after a refresh.
         setTimeout(() => {
+            // The entry may have been removed by a raw purge or another lifecycle
+            // action while the timeout was pending.
+            if (!pendingPurges.includes(entry)) {
+                return;
+            }
+
+            // Destruction is deferred to the next task and re-verified immediately
+            // before execution. React can detach and re-attach a subtree within one
+            // synchronous flush (StrictMode double effects, concurrent transitions),
+            // so a transient zero-subscriber window must never cause destruction.
             const liveKeysAtFire = collectSubscribedKeys(
                 entry.pathPrefix,
                 entry.match
@@ -1401,9 +1463,10 @@ const createStore = <SM extends Record<Name, Section>>(
 
             if (liveKeysAtFire.size > 0) {
                 entry.pendingKeys = liveKeysAtFire;
-                pendingPurges.push(entry);
                 return;
             }
+
+            pendingPurges = pendingPurges.filter(pending => pending !== entry);
 
             purgeYasmState(
                 store,
@@ -1649,10 +1712,6 @@ const createStore = <SM extends Record<Name, Section>>(
                           ? Object.is
                           : shallowEqual;
 
-                let lastSelected: unknown;
-                let hasLastSelected = false;
-                let unsubscribed = false;
-
                 const readSelection = (): unknown => {
                     let state: unknown;
                     try {
@@ -1682,20 +1741,29 @@ const createStore = <SM extends Record<Name, Section>>(
                     }
                 };
 
+                // Establish the baseline eagerly: the first notification
+                // compares against THIS selection, so an unchanged selection
+                // never fires the listener (and `fireImmediately` reports
+                // `(currentSelection, undefined)`).
+                const initialSelected = readSelection();
+                let lastSelected: unknown = initialSelected;
+                let hasNotified = false;
+                let unsubscribed = false;
+
                 const notify = () => {
                     const selected = readSelection();
 
                     // Bail out when the selection did not actually change.
-                    if (hasLastSelected && isEqual(lastSelected, selected)) {
+                    if (isEqual(lastSelected, selected)) {
                         return;
                     }
 
-                    const prevSelected: unknown | undefined = hasLastSelected
+                    const prevSelected: unknown | undefined = hasNotified
                         ? lastSelected
                         : undefined;
 
                     lastSelected = selected;
-                    hasLastSelected = true;
+                    hasNotified = true;
 
                     invokeIsolated(selected, prevSelected);
                 };
@@ -1705,9 +1773,11 @@ const createStore = <SM extends Record<Name, Section>>(
                 const rawUnsubscribe = record.subscribe(notify);
 
                 if (options?.fireImmediately === true) {
-                    // `hasLastSelected` is still false, so `notify` reports
-                    // `(currentSelected, undefined)` exactly as documented.
-                    notify();
+                    // The initial selection is already the equality baseline, so notify()
+                    // would bail out. Invoke the listener directly and treat this as the
+                    // first delivered notification.
+                    invokeIsolated(initialSelected, undefined);
+                    hasNotified = true;
                 }
 
                 return () => {
@@ -2105,8 +2175,8 @@ const createStore = <SM extends Record<Name, Section>>(
         }, {} as Memo<SM>),
 
         pathBoundaryChars: boundaryChars,
-        serializer: options?.serializer ?? ((_, __, value) => value),
-        deserializer: options?.deserializer ?? ((_, value) => value),
+        serializer: options?.serializer ?? DEFAULT_SERIALIZER,
+        deserializer: options?.deserializer ?? DEFAULT_DESERIALIZER,
         // The stored copy uses the variance-safe `ResolvedDebugOptions`
         // (see its docs): the generic input options are assignable at
         // runtime, and the widened `logStateUpdates`/`snapshotFilter` types
@@ -2880,6 +2950,13 @@ const createStore = <SM extends Record<Name, Section>>(
         },
 
         [SYMBOL_NOTIFY_FORCED_UNSUBSCRIBE](name: Name, path: Path) {
+            // A raw purge removes subscriber records without a normal unsubscribe.
+            // Reconcile any pending deferred purge entries that cover the purged path
+            // so dead markers are not persisted after the state has been destroyed.
+            pendingPurges = pendingPurges.filter(
+                entry => !pathMatchesEntry(path, entry)
+            );
+
             handleLastSubscriberLeft(store, name.toString(), path);
         },
 
@@ -2981,7 +3058,10 @@ export type {
 };
 export {
     createStore,
+    pruneUnanchoredRegistrations,
     SYMBOL_NOTIFY_CHANGE,
     SYMBOL_NOTIFY_FORCED_UNSUBSCRIBE,
-    DEFAULT_PATH_BOUNDARY_CHARS
+    DEFAULT_PATH_BOUNDARY_CHARS,
+    DEFAULT_SERIALIZER,
+    DEFAULT_DESERIALIZER
 };

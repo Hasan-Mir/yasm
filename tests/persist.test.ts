@@ -1528,6 +1528,7 @@ test('persistence: raw purge over a pending purgeWhenUnused drains the pending m
     store.purgeWhenUnused('/b'); // pends: /b is subscribed
 
     // A raw purge destroys the subscriber record directly (with a warning).
+    // A raw purge destroys the subscriber record directly (with a warning).
     // The pending entry must reconcile its bookkeeping instead of leaking
     // into every future snapshot's metadata.
     await captureWarnings(() => purgeYasmState(store, '/b'));
@@ -1540,6 +1541,50 @@ test('persistence: raw purge over a pending purgeWhenUnused drains the pending m
     // The late unsubscribe is a tolerant no-op and must not resurrect anything
     unsubscribe();
     assert.equal(store.state.Dummy['/b'], undefined);
+});
+
+test('persistence: deferred purge marker remains persisted until the actual purge executes', async () => {
+    const storage = createMockStorage();
+
+    const store = createStore(
+        { Dummy: dummySection },
+        { persist: { key: 'test-key', storage } }
+    );
+
+    await store.hydrate();
+
+    init(store, 'Dummy', '/gone');
+
+    store.memo.Dummy['/gone'].updater({ count: 2 });
+
+    const unsubscribe = store.memo.Dummy['/gone'].subscribe(() => undefined);
+
+    store.purgeWhenUnused('/gone');
+
+    unsubscribe();
+
+    // This save happens before setTimeout(0) executes.
+    await store.save();
+
+    const duringWindow = JSON.parse(
+        (await storage.getItem('test-key')) as string
+    );
+
+    assert.equal(duringWindow.state.Dummy['/gone'].count, 2);
+    assert.deepEqual(duringWindow.metadata.pendingPurges, [
+        { pathPrefix: '/gone' }
+    ]);
+
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+
+    await store.save();
+
+    const afterPurge = JSON.parse(
+        (await storage.getItem('test-key')) as string
+    );
+
+    assert.equal(afterPurge.state.Dummy['/gone'], undefined);
+    assert.deepEqual(afterPurge.metadata.pendingPurges, []);
 });
 
 test('persistence: immediate purgeWhenUnused leaves no pending markers', async () => {

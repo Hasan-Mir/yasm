@@ -163,6 +163,13 @@ function useYasmStateUpdater<
     return init(store, name, path).updater;
 }
 
+type RebindRoutingResult = {
+    oldRoutedName: Name;
+    oldRoutedPath: Path;
+    newRoutedName: Name;
+    newRoutedPath: Path;
+};
+
 /**
  * Initializes the state of `(name, path)` (when needed) and returns the
  * memoized `{ subscribe, getState, updater }` record for it.
@@ -179,6 +186,7 @@ const init = <SM extends Record<Name, Section>, N extends keyof SM>(
     subscribe: (callback: () => void) => () => void;
     getState: () => SM[N]['initialState'];
     updater: (payload: PayloadAndPayloadCreator<SM, N>) => void;
+    rebindRouting: () => RebindRoutingResult | undefined;
 } => {
     const memo = store.memo[name] as
         | Record<
@@ -187,6 +195,7 @@ const init = <SM extends Record<Name, Section>, N extends keyof SM>(
                   subscribe: (callback: () => void) => () => void;
                   getState: () => any;
                   updater: (payload: any) => void;
+                  rebindRouting: () => RebindRoutingResult | undefined;
               }
           >
         | undefined;
@@ -229,17 +238,14 @@ const init = <SM extends Record<Name, Section>, N extends keyof SM>(
 
     const state = store.state as Record<Name, Record<Path, any>>;
 
-    const {
-        routedName,
-        routedPath,
-        getState: routedGetState,
-        getStateUnsafe: routedGetStateUnsafe,
-        applyPayload
-    } = route(store, name as Name, path);
+    const initialRoute = route(store, name as Name, path);
 
-    if (name === routedName) {
+    if (name === initialRoute.routedName) {
         // The state is stored directly (not routed into a parent section).
-        if (state[routedName][routedPath] === undefined) {
+        if (
+            state[initialRoute.routedName][initialRoute.routedPath] ===
+            undefined
+        ) {
             const initialState = store.sectionMap[name].initialState;
 
             const override =
@@ -267,7 +273,8 @@ const init = <SM extends Record<Name, Section>, N extends keyof SM>(
                 deepFreeze(finalInitialState);
             }
 
-            state[routedName][routedPath] = finalInitialState;
+            state[initialRoute.routedName][initialRoute.routedPath] =
+                finalInitialState;
         }
     }
 
@@ -281,9 +288,21 @@ const init = <SM extends Record<Name, Section>, N extends keyof SM>(
         store.pathRegistry[name as Name].push(path);
     }
 
-    const getState = () => routedGetState();
+    // `activeRoute` is the memo's current physical route.
+    // Any routing-topology change that can affect this memo must go through
+    // `rebindRouting()` so `activeRoute` and its active subscriptions stay in sync.
+    let activeRoute = initialRoute;
+
+    const getState = () => activeRoute.getState();
 
     const updater = (payload: PayloadAndPayloadCreator<SM, N>) => {
+        const {
+            routedName,
+            routedPath,
+            getStateUnsafe: routedGetStateUnsafe,
+            applyPayload
+        } = activeRoute;
+
         // These guards make the updater a safe no-op when it fires
         // asynchronously (in a `setTimeout`, a resolved promise, a stale
         // event handler, ...) after the state has been purged, or after a
@@ -450,14 +469,142 @@ const init = <SM extends Record<Name, Section>, N extends keyof SM>(
         }
     };
 
+    type ActiveSubscription = {
+        callback: () => void;
+        unsubscribe: () => void;
+    };
+
+    const activeSubscriptions = new Set<ActiveSubscription>();
+
+    const subscribe = (callback: () => void) => {
+        const subscription: ActiveSubscription = {
+            callback,
+            unsubscribe: store.subscribe(
+                callback,
+                activeRoute.routedName as keyof SM,
+                activeRoute.routedPath
+            )
+        };
+
+        activeSubscriptions.add(subscription);
+
+        return () => {
+            if (!activeSubscriptions.delete(subscription)) {
+                return;
+            }
+
+            subscription.unsubscribe();
+        };
+    };
+
+    /**
+     * Re-resolves this memo's physical route after routing topology changes.
+     * Updates `activeRoute`, rebinds active subscriptions, and removes stale
+     * direct-storage fallback state when the memo becomes routed.
+     */
+    const rebindRouting = () => {
+        const nextRoute = route(store, name as Name, path);
+
+        if (
+            nextRoute.routedName === activeRoute.routedName &&
+            nextRoute.routedPath === activeRoute.routedPath
+        ) {
+            return undefined;
+        }
+
+        const oldRoutedName = activeRoute.routedName;
+        const oldRoutedPath = activeRoute.routedPath;
+
+        for (const subscription of Array.from(activeSubscriptions)) {
+            subscription.unsubscribe();
+
+            subscription.unsubscribe = store.subscribe(
+                subscription.callback,
+                nextRoute.routedName as keyof SM,
+                nextRoute.routedPath
+            );
+        }
+
+        activeRoute = nextRoute;
+
+        // A direct-storage fallback entry that becomes routed is no longer a
+        // physical state slot. Remove that stale fallback copy.
+        if (
+            oldRoutedName === name &&
+            oldRoutedPath === path &&
+            (nextRoute.routedName !== name || nextRoute.routedPath !== path)
+        ) {
+            delete state[oldRoutedName]?.[oldRoutedPath];
+        }
+
+        return {
+            oldRoutedName,
+            oldRoutedPath,
+            newRoutedName: nextRoute.routedName,
+            newRoutedPath: nextRoute.routedPath
+        };
+    };
+
     const record = {
-        subscribe: (callback: () => void) =>
-            store.subscribe(callback, routedName as keyof SM, routedPath),
+        subscribe,
         getState,
-        updater
+        updater,
+        rebindRouting
     };
     memo[path] = record;
     return record;
+};
+
+/**
+ * Scans active memo records within an affected path prefix and rebinds their
+ * routing accessors and subscriptions to newly registered parent routes.
+ *
+ * This handles the edge case where a routed child hook (e.g. `Row` at `/table[5]`)
+ * initialized before its routing parent (`Table` at `/table`) was registered,
+ * causing the child to fall back to direct unrouted storage.
+ *
+ * When an operation (such as `cloneSubtree`) registers missing parent paths:
+ * 1. Evaluates each matching memo record against the latest routing plan.
+ * 2. If a new parent route is discovered, migrates active listeners to the
+ *    new physical storage location in `store.subscribers`.
+ * 3. Removes stale fallback state from direct storage to prevent ghost copies.
+ * 4. Switches the memo's active route reference so subsequent reads (`getState`)
+ *    and writes (`updater`) dispatch directly through the parent section.
+ */
+const rebindRoutedMemos = <SM extends Record<Name, Section>>(
+    store: Store<SM>,
+    targetPrefix?: string
+): RebindRoutingResult[] => {
+    const changes: RebindRoutingResult[] = [];
+
+    const memoByName = store.memo;
+
+    for (const sectionName of Object.keys(memoByName) as Name[]) {
+        const records = memoByName[sectionName];
+
+        for (const path of Object.keys(records)) {
+            if (
+                targetPrefix !== undefined &&
+                !isPathWithinPrefix(path, targetPrefix, store.pathBoundaryChars)
+            ) {
+                continue;
+            }
+
+            const rebindRouting = records[path]?.rebindRouting;
+
+            if (rebindRouting === undefined) {
+                continue;
+            }
+
+            const change = rebindRouting();
+
+            if (change !== undefined) {
+                changes.push(change);
+            }
+        }
+    }
+
+    return changes;
 };
 
 type RouteStep = { name: Name; path: Path };
@@ -675,5 +822,12 @@ const getExtraRoutes = <SM extends Record<Name, Section>>(
     return parentChain === undefined ? [parent] : [...parentChain, parent];
 };
 
-export { useYasmState, useYasmStateUpdater, init, route, getExtraRoutes };
-export type { OverrideInitialState };
+export {
+    useYasmState,
+    useYasmStateUpdater,
+    init,
+    route,
+    getExtraRoutes,
+    rebindRoutedMemos
+};
+export type { OverrideInitialState, RebindRoutingResult };

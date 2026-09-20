@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import { cloneYasmSubtree } from '../src/clone';
 import { Section, createStore } from '../src/createStore';
 import { init } from '../src/useYasmState';
-import { arraySectionGenerator, mergeUpdaterGenerator } from '../src/util';
+import { arraySectionGenerator, mergeUpdaterGenerator, objectSectionGenerator } from '../src/util';
 import { counterSection } from './helpers';
 
 test('cloneSubtree: clones state across simple sections independently', () => {
@@ -370,4 +370,339 @@ test('cloneSubtree: dev-frozen clone keeps nested references independent', () =>
         assert.equal(Object.isFrozen(target), true);
         assert.equal(Object.isFrozen(target.items), true);
     }
+});
+
+test('cloneSubtree: default cloning preserves native structured-clone types', () => {
+    type State = {
+        date: Date;
+        map: Map<string, number>;
+        set: Set<string>;
+        regex: RegExp;
+    };
+
+    const section: Section<State, Partial<State>> = {
+        initialState: {
+            date: new Date(0),
+            map: new Map(),
+            set: new Set(),
+            regex: /initial/g
+        },
+        updater: mergeUpdaterGenerator<State>()
+    };
+
+    const store = createStore({ State: section });
+
+    init(store, 'State', '/source');
+
+    // Replace the whole state entry directly — no Map/Set value is ever
+    // routed through an Immer draft (which would require the MapSet plugin).
+    store.state.State['/source'] = {
+        date: new Date('2026-09-20T12:00:00.000Z'),
+        map: new Map([['a', 1]]),
+        set: new Set(['x', 'y']),
+        regex: /hello/gi
+    };
+
+    cloneYasmSubtree(store, '/source', '/target');
+
+    const source = store.state.State['/source'];
+    const target = store.state.State['/target'];
+
+    assert.ok(target.date instanceof Date);
+    assert.equal(target.date.toISOString(), source.date.toISOString());
+
+    assert.ok(target.map instanceof Map);
+    assert.deepEqual(Array.from(target.map.entries()), [['a', 1]]);
+
+    assert.ok(target.set instanceof Set);
+    assert.deepEqual(Array.from(target.set.values()), ['x', 'y']);
+
+    assert.ok(target.regex instanceof RegExp);
+    assert.equal(target.regex.source, 'hello');
+    assert.equal(target.regex.flags, 'gi');
+
+    assert.notEqual(target.date, source.date);
+    assert.notEqual(target.map, source.map);
+    assert.notEqual(target.set, source.set);
+    assert.notEqual(target.regex, source.regex);
+});
+
+test('cloneSubtree: throws instead of aliasing a value when both clone mechanisms fail', () => {
+    type State = {
+        value: {
+            fn: () => void;
+            self?: unknown;
+        };
+    };
+
+    const section: Section<State, Partial<State>> = {
+        initialState: {
+            value: {
+                fn: () => undefined
+            }
+        },
+        updater: mergeUpdaterGenerator<State>()
+    };
+
+    const store = createStore({ State: section });
+
+    const value: State['value'] = {
+        fn: () => undefined
+    };
+    value.self = value;
+
+    store.state.State['/source'] = { value };
+
+    assert.throws(
+        () => cloneYasmSubtree(store, '/source', '/target'),
+        /cloneSubtree could not clone/
+    );
+
+    assert.equal(store.state.State['/target'], undefined);
+
+    if (process.env.NODE_ENV !== 'production') {
+        assert.equal(Object.isFrozen(value), false);
+    }
+});
+
+test('cloneSubtree: transform failure leaves the entire target unchanged', () => {
+    const store = createStore({ Counter: counterSection });
+
+    init(store, 'Counter', '/source/a');
+    init(store, 'Counter', '/source/b');
+    init(store, 'Counter', '/target/a');
+    init(store, 'Counter', '/target/b');
+
+    // Initial state is deep-frozen in dev — seed through the updaters.
+    store.memo.Counter['/source/a'].updater({ count: 1 });
+    store.memo.Counter['/source/b'].updater({ count: 2 });
+    store.memo.Counter['/target/a'].updater({ count: 10 });
+    store.memo.Counter['/target/b'].updater({ count: 20 });
+
+    let notified = 0;
+
+    store.subscribe(
+        () => {
+            notified++;
+        },
+        'Counter',
+        '/target/a'
+    );
+
+    assert.throws(
+        () =>
+            cloneYasmSubtree(store, '/source', '/target', {
+                transform: (_sectionName, state, sourcePath) => {
+                    if (sourcePath === '/source/b') {
+                        throw new Error('transform failure');
+                    }
+
+                    return state;
+                }
+            }),
+        /transform failure/
+    );
+
+    assert.equal(store.state.Counter['/target/a'].count, 10);
+    assert.equal(store.state.Counter['/target/b'].count, 20);
+    assert.equal(notified, 0);
+});
+
+test('cloneSubtree: subscribers observe the fully committed subtree before reentrant updates', () => {
+    const store = createStore({ Counter: counterSection });
+
+    init(store, 'Counter', '/source/a');
+    init(store, 'Counter', '/source/b');
+    init(store, 'Counter', '/target/a');
+    init(store, 'Counter', '/target/b');
+
+    store.memo.Counter['/source/a'].updater({ count: 1 });
+    store.memo.Counter['/source/b'].updater({ count: 2 });
+
+    store.memo.Counter['/target/a'].updater({ count: 10 });
+    store.memo.Counter['/target/b'].updater({ count: 20 });
+
+    const observed: number[] = [];
+    let reentered = false;
+
+    store.subscribe(
+        () => {
+            observed.push(store.state.Counter['/target/b'].count);
+
+            if (!reentered) {
+                reentered = true;
+                store.memo.Counter['/target/b'].updater({ count: 99 });
+            }
+        },
+        'Counter',
+        '/target/a'
+    );
+
+    cloneYasmSubtree(store, '/source', '/target');
+
+    assert.deepEqual(observed, [2]);
+    assert.equal(store.state.Counter['/target/a'].count, 1);
+    assert.equal(store.state.Counter['/target/b'].count, 99);
+});
+
+test('cloneSubtree: pre-mounted routed child rebinds after its target parent is registered', () => {
+    const rowSection: Section<
+        { title: string },
+        Partial<{ title: string }>
+    > = {
+        initialState: { title: '' },
+        updater: mergeUpdaterGenerator<{ title: string }>()
+    };
+
+    const store = createStore({
+        Table: arraySectionGenerator('Row', rowSection),
+        Row: rowSection
+    });
+
+    init(store, 'Table', '/source/table');
+
+    store.memo.Table['/source/table'].updater({
+        addingItems: [
+            {
+                id: 5,
+                partialState: {
+                    title: 'Item 5'
+                }
+            }
+        ],
+        order: [5]
+    });
+
+    // The child is initialized BEFORE the target parent exists.
+    init(store, 'Row', '/target/table[5]');
+
+    const childRecord = store.memo.Row['/target/table[5]'];
+
+    const notifications: string[] = [];
+    const unsubscribe = childRecord.subscribe(() => {
+        notifications.push(childRecord.getState().title);
+    });
+
+    assert.equal(childRecord.getState().title, '');
+
+    cloneYasmSubtree(store, '/source', '/target');
+
+    assert.equal(childRecord.getState().title, 'Item 5');
+    assert.deepEqual(notifications, ['Item 5']);
+    assert.equal(store.state.Row['/target/table[5]'], undefined);
+
+    unsubscribe();
+});
+
+test('cloneSubtree: omitSections does not create dangling descendant routing registrations', () => {
+    const profileSection: Section<
+        { name: string },
+        Partial<{ name: string }>
+    > = {
+        initialState: { name: '' },
+        updater: mergeUpdaterGenerator<{ name: string }>()
+    };
+
+    const rowForm = objectSectionGenerator({
+        profile: {
+            name: 'Profile',
+            state: profileSection.initialState,
+            updater: profileSection.updater
+        }
+    });
+
+    const store = createStore({
+        Table: arraySectionGenerator('Row', rowForm),
+        Row: rowForm,
+        Profile: profileSection
+    });
+
+    init(store, 'Table', '/source/table');
+
+    store.memo.Table['/source/table'].updater({
+        addingItems: [
+            {
+                id: 5,
+                partialState: {
+                    profile: {
+                        name: 'Sara'
+                    }
+                }
+            }
+        ],
+        order: [5]
+    });
+
+    init(store, 'Row', '/source/table[5]');
+
+    cloneYasmSubtree(store, '/source', '/target', {
+        omitSections: ['Table']
+    });
+
+    assert.equal(store.state.Table['/target/table'], undefined);
+    assert.equal(
+        store.pathRegistry.Table.includes('/target/table'),
+        false
+    );
+    assert.equal(
+        store.pathRegistry.Row.includes('/target/table[5]'),
+        false
+    );
+
+    init(store, 'Profile', '/target/table[5][profile]');
+
+    assert.doesNotThrow(() => {
+        store.memo.Profile['/target/table[5][profile]'].getState();
+    });
+
+    assert.equal(
+        store.state.Profile['/target/table[5][profile]'].name,
+        ''
+    );
+});
+
+test('cloneSubtree: startsWith mode uses the raw source prefix', () => {
+    const store = createStore({ Counter: counterSection });
+
+    init(store, 'Counter', '/tabs/1/child');
+    init(store, 'Counter', '/tabs/10');
+
+    store.memo.Counter['/tabs/1/child'].updater({ count: 1 });
+    store.memo.Counter['/tabs/10'].updater({ count: 10 });
+
+    cloneYasmSubtree(store, '/tabs/1/', '/copy', {
+        match: 'startsWith'
+    });
+
+    assert.equal(store.state.Counter['/copy/child'].count, 1);
+    assert.equal(store.state.Counter['/copy0'], undefined);
+});
+
+test('cloneSubtree: target root prefix clones the exact source path to root', () => {
+    const store = createStore({ Counter: counterSection });
+
+    init(store, 'Counter', '/source');
+    store.memo.Counter['/source'].updater({ count: 7 });
+
+    cloneYasmSubtree(store, '/source', '/');
+
+    assert.equal(store.state.Counter['/'].count, 7);
+    assert.equal(store.state.Counter['']?.count, undefined);
+});
+
+test('cloneSubtree: source root prefix clones the exact root entry and descendants to the target prefix', () => {
+    const store = createStore({ Counter: counterSection });
+
+    init(store, 'Counter', '/');
+    init(store, 'Counter', '/child');
+
+    store.memo.Counter['/'].updater({ count: 1 });
+    store.memo.Counter['/child'].updater({ count: 2 });
+
+    cloneYasmSubtree(store, '/', '/copy');
+
+    assert.equal(store.state.Counter['/copy'].count, 1);
+    assert.equal(store.state.Counter['/copy/child'].count, 2);
+    assert.equal(store.state.Counter['/copy/']?.count, undefined);
+    assert.equal(store.state.Counter['/copy//child']?.count, undefined);
 });

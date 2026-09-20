@@ -1,9 +1,12 @@
 import {
+    DEFAULT_DESERIALIZER,
+    DEFAULT_SERIALIZER,
     SYMBOL_NOTIFY_CHANGE,
     Name,
     Path,
     Section,
-    Store
+    Store,
+    pruneUnanchoredRegistrations
 } from './createStore';
 import {
     composeDebugLogArgs,
@@ -11,6 +14,8 @@ import {
     isPathWithinPrefix,
     serializeForSnapshot
 } from './util';
+
+import { rebindRoutedMemos } from './useYasmState';
 
 type CloneSubtreeOptions<
     SM extends Record<Name, Section> = Record<Name, Section>
@@ -78,15 +83,20 @@ const cloneYasmSubtree = <SM extends Record<Name, Section>>(
     targetPrefix: string,
     options?: CloneSubtreeOptions<SM>
 ): void => {
-    // Normalizes prefix by trimming trailing slash to prevent path boundary mangling
+    const matchMode = options?.match ?? 'segment';
+
     const normalizePrefix = (prefix: string): string => {
-        if (prefix.endsWith('/')) {
+        if (prefix.length > 1 && prefix.endsWith('/')) {
             return prefix.slice(0, -1);
         }
         return prefix;
     };
 
-    const normSource = normalizePrefix(sourcePrefix);
+    const normSource =
+        matchMode === 'startsWith'
+            ? sourcePrefix
+            : normalizePrefix(sourcePrefix);
+
     const normTarget = normalizePrefix(targetPrefix);
 
     if (normSource === normTarget) {
@@ -94,13 +104,39 @@ const cloneYasmSubtree = <SM extends Record<Name, Section>>(
     }
 
     const boundaryChars = store.pathBoundaryChars;
-    const matchMode = options?.match ?? 'segment';
 
     const matches = (path: Path): boolean => {
         if (matchMode === 'startsWith') {
             return path.startsWith(normSource);
         }
+
         return isPathWithinPrefix(path, normSource, boundaryChars);
+    };
+
+    const buildTargetPath = (sourcePath: Path): Path => {
+        // Slicing uses the normalized source so a raw `startsWith` prefix
+        // with a trailing slash still produces slash-joined target paths.
+        // A root source prefix maps the exact root entry itself to the
+        // empty relative part ('/' → normTarget, never `${normTarget}/`).
+        const sliceBase = normalizePrefix(sourcePrefix);
+        const relativePath =
+            sliceBase === '/'
+                ? sourcePath === '/'
+                    ? ''
+                    : sourcePath
+                : sourcePath.slice(sliceBase.length);
+
+        if (normTarget === '/') {
+            if (relativePath === '') {
+                return '/';
+            }
+
+            return relativePath.startsWith('/')
+                ? relativePath
+                : `/${relativePath}`;
+        }
+
+        return `${normTarget}${relativePath}`;
     };
 
     const omitted = new Set<string>(
@@ -137,34 +173,47 @@ const cloneYasmSubtree = <SM extends Record<Name, Section>>(
         );
     }
 
-    // Deep clone helper utilizing the store's serializer and deserializer
-    // to preserve BigInt, Decimal, Date, and undefined placeholders
-    const deepCloneValue = (val: unknown): unknown => {
+    const hasCustomSerialization =
+        store.serializer !== DEFAULT_SERIALIZER ||
+        store.deserializer !== DEFAULT_DESERIALIZER;
+
+    const deepCloneValue = (
+        val: unknown,
+        sectionName: keyof SM,
+        sourcePath: Path
+    ): unknown => {
         if (val === undefined || val === null || typeof val !== 'object') {
             return val;
         }
 
-        try {
-            return serializeForSnapshot(val, store);
-        } catch {
-            if (typeof structuredClone === 'function') {
-                try {
-                    return structuredClone(val);
-                } catch {
-                    return val;
-                }
+        if (hasCustomSerialization) {
+            try {
+                return serializeForSnapshot(val, store);
+            } catch {
+                // Fall through to structuredClone.
             }
-            return val;
         }
+
+        if (typeof structuredClone === 'function') {
+            try {
+                return structuredClone(val);
+            } catch {
+                // Fall through to the final explicit error.
+            }
+        }
+
+        throw new Error(
+            `YASM: cloneSubtree could not clone "${String(sectionName)}" at path "${sourcePath}".`
+        );
     };
 
-    // 1. Snapshot matching state entries first to prevent self-matching loops
     type StateCandidate = {
         sectionName: keyof SM;
         sourcePath: Path;
         targetPath: Path;
         value: unknown;
     };
+
     const stateCandidates: StateCandidate[] = [];
 
     for (const sectionName of Object.keys(store.state) as (keyof SM)[]) {
@@ -173,33 +222,32 @@ const cloneYasmSubtree = <SM extends Record<Name, Section>>(
         }
 
         const sectionState = store.state[sectionName] as
-            Record<Path, unknown> | undefined;
+            | Record<Path, unknown>
+            | undefined;
 
         if (sectionState === undefined) {
             continue;
         }
 
         for (const path of Object.keys(sectionState)) {
-            if (matches(path)) {
-                const relativePath = path.slice(normSource.length);
-                const targetPath = `${normTarget}${relativePath}`;
-
-                stateCandidates.push({
-                    sectionName,
-                    sourcePath: path,
-                    targetPath,
-                    value: sectionState[path]
-                });
+            if (!matches(path)) {
+                continue;
             }
+
+            stateCandidates.push({
+                sectionName,
+                sourcePath: path,
+                targetPath: buildTargetPath(path),
+                value: sectionState[path]
+            });
         }
     }
 
-    // 2. Snapshot matching pathRegistry entries for composed routing
-    // (ArraySection / ObjectSection) so routed children keep working on the target
     type RegistryCandidate = {
         sectionName: Name;
         targetPath: Path;
     };
+
     const registryCandidates: RegistryCandidate[] = [];
 
     for (const sectionName of Object.keys(store.pathRegistry)) {
@@ -208,32 +256,30 @@ const cloneYasmSubtree = <SM extends Record<Name, Section>>(
         }
 
         const registeredPaths = store.pathRegistry[sectionName];
+
         if (!Array.isArray(registeredPaths)) {
             continue;
         }
 
         for (const registeredPath of registeredPaths) {
-            if (matches(registeredPath)) {
-                const relativePath = registeredPath.slice(normSource.length);
-                const targetPath = `${normTarget}${relativePath}`;
-                registryCandidates.push({
-                    sectionName,
-                    targetPath
-                });
+            if (!matches(registeredPath)) {
+                continue;
             }
+
+            registryCandidates.push({
+                sectionName,
+                targetPath: buildTargetPath(registeredPath)
+            });
         }
     }
 
-    let isStateChanged = false;
-
-    // 3. Write cloned values to store.state
-    for (const candidate of stateCandidates) {
-        const sectionState = store.state[candidate.sectionName] as Record<
-            Path,
-            unknown
-        >;
-
-        let cloned = deepCloneValue(candidate.value);
+    // Prepare every clone before mutating the live store.
+    const preparedStateCandidates = stateCandidates.map(candidate => {
+        let cloned = deepCloneValue(
+            candidate.value,
+            candidate.sectionName,
+            candidate.sourcePath
+        );
 
         if (options?.transform !== undefined) {
             cloned = options.transform(
@@ -248,49 +294,153 @@ const cloneYasmSubtree = <SM extends Record<Name, Section>>(
             deepFreeze(cloned);
         }
 
-        sectionState[candidate.targetPath] = cloned;
-        isStateChanged = true;
+        return {
+            ...candidate,
+            cloned
+        };
+    });
 
-        // If components are already mounted at the target path, notify them safely
-        const pathSubscribers = (
-            store.subscribers as Record<
-                Name,
-                Record<Path, Record<number, () => void>>
-            >
-        )[candidate.sectionName as Name]?.[candidate.targetPath];
+    // Build a hypothetical post-clone state/registry view and run the same
+    // routing-anchor invariant used by hydration.
+    const proposedState = (Object.keys(store.state) as (keyof SM)[]).reduce(
+        (result, sectionName) => {
+            result[String(sectionName)] = {
+                ...(store.state[sectionName] as Record<Path, unknown>)
+            };
+            return result;
+        },
+        {} as Record<string, Record<Path, unknown>>
+    );
 
-        if (pathSubscribers !== undefined) {
-            for (const id of Object.keys(pathSubscribers)) {
-                const callback = pathSubscribers[id as unknown as number];
-                if (callback !== undefined) {
-                    try {
-                        callback();
-                    } catch (error) {
-                        console.error(
-                            'YASM: a subscriber callback threw an exception during clone. The error is isolated so other subscribers are still notified.',
-                            error
-                        );
-                    }
-                }
-            }
+    for (const candidate of preparedStateCandidates) {
+        proposedState[String(candidate.sectionName)][candidate.targetPath] =
+            candidate.cloned;
+    }
+
+    const proposedRegistry = Object.keys(store.pathRegistry).reduce(
+        (result, sectionName) => {
+            result[sectionName] = [...store.pathRegistry[sectionName]];
+            return result;
+        },
+        {} as Record<string, string[]>
+    );
+
+    for (const candidate of registryCandidates) {
+        if (proposedRegistry[candidate.sectionName] === undefined) {
+            proposedRegistry[candidate.sectionName] = [];
+        }
+
+        if (
+            !proposedRegistry[candidate.sectionName].includes(
+                candidate.targetPath
+            )
+        ) {
+            proposedRegistry[candidate.sectionName].push(candidate.targetPath);
         }
     }
 
-    // 4. Register cloned paths in store.pathRegistry
-    for (const candidate of registryCandidates) {
+    pruneUnanchoredRegistrations(
+        proposedRegistry,
+        proposedState,
+        store.routingPlan as Record<string, string[] | undefined>,
+        boundaryChars
+    );
+
+    const validRegistryKeys = new Set(
+        Object.entries(proposedRegistry).flatMap(
+            ([sectionName, paths]) =>
+                paths.map(path => `${sectionName}\u0000${path}`)
+        )
+    );
+
+    const validRegistryCandidates = registryCandidates.filter(candidate =>
+        validRegistryKeys.has(
+            `${candidate.sectionName}\u0000${candidate.targetPath}`
+        )
+    );
+
+    const notificationTargets = new Set<string>();
+
+    // Commit ALL state before invoking ANY subscriber.
+    for (const candidate of preparedStateCandidates) {
+        const sectionState = store.state[candidate.sectionName] as Record<
+            Path,
+            unknown
+        >;
+
+        sectionState[candidate.targetPath] = candidate.cloned;
+
+        notificationTargets.add(
+            `${String(candidate.sectionName)}\u0000${candidate.targetPath}`
+        );
+    }
+
+    // Commit ALL valid routing registrations before invoking ANY subscriber.
+    for (const candidate of validRegistryCandidates) {
         const registeredPaths = store.pathRegistry[candidate.sectionName];
+
         if (
             Array.isArray(registeredPaths) &&
             !registeredPaths.includes(candidate.targetPath)
         ) {
             registeredPaths.push(candidate.targetPath);
-            isStateChanged = true;
         }
     }
 
-    // 5. Trigger notifications and auto-save if any state or routing was added
-    if (isStateChanged) {
-        store[SYMBOL_NOTIFY_CHANGE]();
+    const reboundRoutes = rebindRoutedMemos(store, normTarget);
+
+    for (const change of reboundRoutes) {
+        notificationTargets.add(
+            `${String(change.newRoutedName)}\u0000${change.newRoutedPath}`
+        );
+    }
+
+    const isStateChanged =
+        preparedStateCandidates.length > 0 ||
+        validRegistryCandidates.length > 0;
+
+    if (!isStateChanged) {
+        return;
+    }
+
+    // Global notification happens only after the complete clone is committed.
+    store[SYMBOL_NOTIFY_CHANGE]();
+
+    // Notify target subscribers only after the whole subtree and routing
+    // topology have been committed.
+    for (const target of Array.from(notificationTargets)) {
+        const separatorIndex = target.indexOf('\u0000');
+
+        const sectionName = target.slice(0, separatorIndex) as Name;
+        const targetPath = target.slice(separatorIndex + 1);
+
+        const pathSubscribers = (
+            store.subscribers as Record<
+                Name,
+                Record<Path, Record<number, () => void>>
+            >
+        )[sectionName]?.[targetPath];
+
+        if (pathSubscribers === undefined) {
+            continue;
+        }
+
+        for (const id of Object.keys({ ...pathSubscribers })) {
+            const callback = pathSubscribers[id as unknown as number];
+
+            if (callback === undefined) {
+                continue;
+            }
+
+            try {
+                callback();
+            } catch (error) {
+                console.error(
+                    'YASM: a subscriber callback threw an exception during clone. The error is isolated so other subscribers are still notified.',
+                    error
+                );
+            }
+        }
     }
 };
 
