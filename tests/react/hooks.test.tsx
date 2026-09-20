@@ -3,6 +3,7 @@ import { YasmContext } from '../../src/Context';
 import { Section, createStore } from '../../src/createStore';
 import { usePurgeWhenUnused } from '../../src/usePurgeWhenUnused';
 import { usePurgeYasmState } from '../../src/usePurgeYasmState';
+import { useCloneYasmSubtree } from '../../src/useCloneYasmSubtree';
 import {
     init,
     useYasmState,
@@ -34,6 +35,10 @@ test('hooks throw a helpful error when no provider is mounted (client render)', 
             usePurgeYasmState();
             return null;
         };
+        const CloneConsumer = () => {
+            useCloneYasmSubtree();
+            return null;
+        };
 
         // The hook throws during rendering, which is the public error
         // contract — now verified in a real mounted tree, not just SSR.
@@ -44,6 +49,9 @@ test('hooks throw a helpful error when no provider is mounted (client render)', 
             /no store was found in the React context/
         );
         expect(() => render(<PurgeConsumer />)).toThrow(
+            /no store was found in the React context/
+        );
+        expect(() => render(<CloneConsumer />)).toThrow(
             /no store was found in the React context/
         );
     } finally {

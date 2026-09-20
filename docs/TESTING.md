@@ -35,6 +35,9 @@ The package entry point (`src/index.ts`) exposes the following runtime values:
 | `store.getHydrationStatus()` | Current hydration status: `'idle' \| 'hydrating' \| 'hydrated' \| 'failed' \| 'quarantined'`. |
 | `store.getHydrationSnapshot()` | Stable memoized `HydrationResult` (same object until the status transitions). |
 | `store.subscribeHydration(cb)` | Subscribes to hydration status transitions; returns the unsubscribe function. |
+| `cloneYasmSubtree(store, source, target, opt?)` | Deeply clones matching state and pathRegistry entries. Supports `match` ('segment' | 'startsWith'), `omitSections`, and `transform`. |
+| `useCloneYasmSubtree()`                         | Returns `cloneSubtree` bound to context store.                                                                                       |
+| `store.cloneSubtree(source, target, options?)`  | Store method pre-bound to `cloneYasmSubtree`.                                                                                        |
 | `arraySectionGenerator(childName, childSection)` | Creates `{ order, map }` state with `order`, `addingItems`, `editingItems`, and `removingIDs` updater operations and child routing via `[id]`. |
 | `objectSectionGenerator(sectionMap)` | Composes named child definitions; child routing uses `[childKey]`. |
 | `propertyUpdaterGenerator<S>()` | Returns an updater accepting `{ key, value }`; unchanged values preserve identity. |

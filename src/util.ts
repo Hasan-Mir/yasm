@@ -1197,6 +1197,7 @@ export {
     mergeUpdaterGenerator,
     objectSectionGenerator,
     propertyUpdaterGenerator,
+    serializeForSnapshot,
     snapshot,
     snapshotByPrefix,
     type ArraySection,

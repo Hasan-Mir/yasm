@@ -3,6 +3,8 @@ export { useYasmState, useYasmStateUpdater } from './useYasmState';
 export { useHydration } from './useHydration';
 export { usePurgeYasmState } from './usePurgeYasmState';
 export { usePurgeWhenUnused } from './usePurgeWhenUnused';
+export { useCloneYasmSubtree } from './useCloneYasmSubtree';
+export { cloneYasmSubtree, type CloneSubtreeOptions } from './clone';
 export { purgeYasmState, type PurgeOptions } from './purge';
 export {
     type ArraySection,

@@ -808,6 +808,111 @@ Guarantees:
 
 ---
 
+## 📋 Subtree Cloning (`store.cloneSubtree` & `useCloneYasmSubtree`)
+
+In multi-instance workspace applications (such as ERPs, CMS platforms, or multi-tab desktops), users frequently want to duplicate an entire tab or modal—similar to **"Duplicate Tab" in Google Chrome**.
+
+Because a tab often contains dozens of nested tables, forms, and cell states (e.g. `PriceManage`, `PriceFormTable`, `PriceTypeCell`, `NumberCell`), manually reading and re-dispatching each state slice is error-prone and breaks routing.
+
+`store.cloneSubtree(sourcePrefix, targetPrefix, options?)` (or the `useCloneYasmSubtree()` hook) performs a deep, decoupled duplication of an entire path subtree:
+
+```tsx
+import { useCloneYasmSubtree } from '@mrnafisia/yasm';
+
+const cloneSubtree = useCloneYasmSubtree();
+
+// Duplicate Tab 1 to Tab 2:
+const handleDuplicateTab = () => {
+    cloneSubtree('/tabs/1', '/tabs/2', {
+        // Optional: omit temporary dialogs or transient view state
+        omitSections: ['Dialog', 'ManageDialog'],
+        // Optional: transform cloned values before writing
+        transform: (sectionName, state, sourcePath, targetPath) => {
+            if (sectionName === 'PriceManage') {
+                return { ...state, title: `${state.title} (Copy)` };
+            }
+            return state;
+        }
+    });
+};
+```
+
+### Core Guarantees & Features:
+
+1. **Deep Independence**:
+Values are round-tripped through the store's top-level serializer/deserializer, guaranteeing that custom objects like `Decimal`, `BigInt`, and `Date` become fresh, isolated instances. Modifying values in the duplicated tab will never mutate or leak into the original tab.
+2. **Composed Section Routing Support**:
+When using `arraySectionGenerator` or `objectSectionGenerator`, parent paths are registered inside `store.pathRegistry`. `cloneSubtree` automatically duplicates matching `pathRegistry` records to the new prefix. Composed child hooks (e.g., `useYasmState('Row', '/tabs/2/table[5]')`) will immediately resolve through their parent table without falling back to unrouted direct storage.
+3. **Segment-Aware Path Matching**:
+Like `purgeYasmState`, matching is segment-aware by default. Cloning `'/tabs/1'` to `'/tabs/2'` will clone `'/tabs/1/form'` and `'/tabs/1[5]'`, but will **never** accidentally hijack sibling paths like `'/tabs/10'`. Asymmetric trailing slashes (e.g., `'/tabs/1/'` vs `'/tabs/2'`) are automatically normalized.
+4. **Persistence & Change Notification**:
+Cloning triggers internal change notifications (`store[SYMBOL_NOTIFY_CHANGE]()`), scheduling debounced persistence auto-saves and alerting `onStateChange` listeners.
+5. **Purge Compatibility**:
+Because all cloned state instances and routing paths reside cleanly under `targetPrefix`, closing the duplicated tab and calling `purgeWhenUnused(targetPrefix)` cleanly wipes all duplicate state without leaving orphaned memory.
+
+### Options
+
+| Option | Type | Description | Default |
+| --- | --- | --- | --- |
+| `match` | `'segment' \| 'startsWith'` | How `sourcePrefix` is matched against stored paths. | `'segment'` |
+| `omitSections` | `(keyof SM)[]` | Sections to exclude from the cloning process. | `[]` |
+| `transform` | `(sectionName, state, sourcePath, targetPath) => unknown` | Hook to mutate or sanitize state before insertion at `targetPath`. | `undefined` |
+
+### Complete Tab Duplication Example
+
+```tsx
+import { useCloneYasmSubtree } from '@mrnafisia/yasm';
+
+type Tab = { id: string; title: string; path: string };
+
+const TabsBar = () => {
+    const cloneSubtree = useCloneYasmSubtree();
+    const [tabs, setTabs] = useState<Tab[]>([
+        { id: '1', title: 'Invoice #101', path: '/tabs/1' }
+    ]);
+    const [activeTabId, setActiveTabId] = useState('1');
+
+    const duplicateTab = (sourceTab: Tab) => {
+        const nextId = String(Date.now());
+        const targetPath = `/tabs/${nextId}`;
+
+        // 1. Deep clone all YASM state and routing from the source tab
+        cloneSubtree(sourceTab.path, targetPath, {
+            omitSections: ['Dialog'], // Don't copy open modal dialogs
+            transform: (sectionName, state) => {
+                if (sectionName === 'InvoiceForm') {
+                    // Reset invoice number or status if required
+                    return { ...state, isDraft: true };
+                }
+                return state;
+            }
+        });
+
+        // 2. Add the cloned tab to UI state and focus it
+        const newTab: Tab = {
+            id: nextId,
+            title: `${sourceTab.title} (Copy)`,
+            path: targetPath
+        };
+
+        setTabs(prev => [...prev, newTab]);
+        setActiveTabId(nextId);
+    };
+
+    return (
+        <div>
+            {tabs.map(tab => (
+                <div key={tab.id} onContextMenu={() => duplicateTab(tab)}>
+                    {tab.title}
+                </div>
+            ))}
+        </div>
+    );
+};
+```
+
+---
+
 ## 💾 Persistence
 
 Persistence is configured in the second argument to `createStore`. YASM saves `store.state`, `store.pathRegistry`, and a small `metadata` record (used for migration bookkeeping). The registry is required to restore composition/routing correctly.
@@ -1596,6 +1701,9 @@ const useValueState = <T>(path: string, initial: T) => {
 | `getFieldSetter(updateState, field)`              | function | Cached per-field setter factory.                                                                                                                                                  |
 | `isPathWithinPrefix(path, prefix, boundaryChars)` | function | Segment-aware prefix check.                                                                                                                                                       |
 | `store.snapshotByPrefix(prefix?, options?)`       | method   | Pre-bound scoped snapshot (overloaded: prefix / prefix-array / options-only) — same result as the standalone helper.                                                               |
+| `store.cloneSubtree(source, target, options?)`    | method   | Deeply clones a state subtree and its pathRegistry entries from sourcePrefix to targetPrefix. |
+| `useCloneYasmSubtree()`                           | hook     | Returns `cloneSubtree(sourcePrefix, targetPrefix, options?)` bound to the context store.      |
+| `cloneYasmSubtree(store, source, target, opt?)`   | function | Pure function to clone subtrees outside React.                                                |
 | `createMemoryStorage()`                           | function | In-memory `persist.storage` adapter for tests/stories/SSR; exposes its backing `Map` as `.data`.                                                                                  |
 | `DEFAULT_PATH_BOUNDARY_CHARS`                     | constant | The default segment boundaries (`'/'`, `'['`, `'.'`); customize via the `pathBoundaryChars` store option.                                                                         |
 

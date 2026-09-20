@@ -6,6 +6,7 @@ import {
 } from './util';
 import { purgeYasmState, type PurgeOptions } from './purge';
 import { init, route } from './useYasmState';
+import { cloneYasmSubtree, type CloneSubtreeOptions } from './clone';
 
 type Name = string;
 type Path = string;
@@ -347,10 +348,13 @@ type Section<S = any, P = any> = {
  * - `update`: the section path was updated with `payload` (already resolved
  *   when a payload creator was used).
  * - `purge`: every path matching `pathPrefix` is being purged.
+ * - `clone`: every path matching `sourcePrefix` is being cloned into
+ *   `targetPrefix`.
  */
 type LogEvent<SM extends Record<Name, Section> = Record<Name, Section>> =
     | { type: 'update'; sectionName: keyof SM; path: Path; payload: unknown }
-    | { type: 'purge'; pathPrefix: string };
+    | { type: 'purge'; pathPrefix: string }
+    | { type: 'clone'; sourcePrefix: string; targetPrefix: string };
 
 /**
  * Filters and shaping for the FULL development snapshots (the before/after
@@ -1066,6 +1070,26 @@ type Store<SM extends Record<Name, Section> = Record<Name, Section>> = {
         pathPrefix: string | string[],
         options?: PurgeOptions
     ) => void;
+
+    /**
+     * Deeply clones all state entries and routing registrations whose paths
+     * match `sourcePrefix` into corresponding paths under `targetPrefix`.
+     *
+     * The cloned state is fully decoupled from the source (deep, serialized
+     * copy) and every matching `pathRegistry` entry is duplicated too, so
+     * routed children (`ArraySection` / `ObjectSection`) keep working on the
+     * duplicate immediately. Matching is segment-aware by default
+     * (`'/tabs/1'` never touches `'/tabs/10'`).
+     *
+     * @param sourcePrefix - The path prefix to copy from.
+     * @param targetPrefix - The new path prefix to clone into.
+     * @param options - Options to omit sections or transform cloned values.
+     */
+    cloneSubtree(
+        sourcePrefix: string,
+        targetPrefix: string,
+        options?: CloneSubtreeOptions<SM>
+    ): void;
 
     /**
      * Convenience wrapper around the exported {@link snapshotByPrefix}()
@@ -2219,6 +2243,18 @@ const createStore = <SM extends Record<Name, Section>>(
             for (const prefix of prefixes) {
                 schedulePurgeWhenUnused(store, prefix, options?.match);
             }
+        },
+
+        /**
+         * Deeply clones all state entries and pathRegistry entries matching
+         * `sourcePrefix` into corresponding paths under `targetPrefix`.
+         */
+        cloneSubtree(
+            sourcePrefix: string,
+            targetPrefix: string,
+            options?: CloneSubtreeOptions<SM>
+        ) {
+            cloneYasmSubtree(store, sourcePrefix, targetPrefix, options);
         },
 
         /**
