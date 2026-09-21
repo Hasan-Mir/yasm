@@ -307,9 +307,9 @@ setCount(prev => prev + 1);
 
 The setter cache is keyed by the updater function — and YASM keeps the updater reference stable per `(section, path)` — so the same setter reference survives re-renders and remounts, and is safe to use in dependency arrays.
 
-> ⚠️ **Optional Properties, ****`undefined`****, and ****`exactOptionalPropertyTypes`**
+> ⚠️ **Optional Properties, `undefined`, and `exactOptionalPropertyTypes`**
 >
-> YASM's partial-update APIs use optional properties to mean “leave this field unchanged”. TypeScript's default behavior also allows an explicit `undefined` for those properties:
+> YASM's partial-update APIs use optional properties to mean "leave this field unchanged". Under TypeScript's default behavior, optional properties also accept an explicit `undefined`:
 >
 > ```ts
 > updateState({ age: undefined });
@@ -317,7 +317,7 @@ The setter cache is keyed by the updater function — and YASM keeps the updater
 >
 > If `age` is a `number`, this can accidentally overwrite a valid value with `undefined`.
 >
-> The TypeScript option `exactOptionalPropertyTypes` prevents this:
+> Enabling `exactOptionalPropertyTypes` in `tsconfig.json` prevents this at the compiler level:
 >
 > ```json
 > {
@@ -327,13 +327,63 @@ The setter cache is keyed by the updater function — and YASM keeps the updater
 > }
 > ```
 >
-> However, this option is not part of `strict`, and enabling it globally can be impractical in existing applications because third-party declaration files may rely on the looser optional-property behavior. In particular, large UI libraries can produce many compatibility errors.
+> However, `exactOptionalPropertyTypes` is not part of `strict`, and enabling it globally can be impractical in existing applications because third-party component libraries often rely on looser optional property definitions.
 >
-> For that reason, YASM does not require `exactOptionalPropertyTypes` to be enabled.
+> ---
 >
-> #### Recommended state design
+> ### 🛡️ Recommended Solution: `eslint-plugin-yasm`
 >
-> When a field can intentionally have “no value”, prefer a required property with an explicit `null` value:
+> If your project cannot enable `exactOptionalPropertyTypes` globally, use the type-aware ESLint plugin:
+>
+> [**`eslint-plugin-yasm`**](https://github.com/Hasan-Mir/eslint-plugin-yasm)
+>
+> It inspects the original section state definition and flags any explicit assignment of `undefined` unless the field was declared with a type that explicitly permits it (such as `age: number | undefined` or `score: unknown`):
+>
+> ```bash
+> npm install -D eslint-plugin-yasm @typescript-eslint/parser
+> ```
+>
+> Add it to your ESLint configuration:
+>
+> ```js
+> // eslint.config.js (Flat Config)
+> import { defineConfig } from 'eslint/config';
+> import tsParser from '@typescript-eslint/parser';
+> import yasmPlugin from 'eslint-plugin-yasm';
+>
+> export default defineConfig([
+>     {
+>         files: ['**/*.{ts,tsx}'],
+>         languageOptions: {
+>             parser: tsParser,
+>             parserOptions: {
+>                 project: true,
+>             },
+>         },
+>         extends: [yasmPlugin.configs['flat/recommended']],
+>     },
+> ]);
+> ```
+>
+> ```js
+> // .eslintrc.js (Legacy Config)
+> module.exports = {
+>     parser: '@typescript-eslint/parser',
+>     parserOptions: {
+>         project: ['./tsconfig.json'],
+>         tsconfigRootDir: __dirname,
+>     },
+>     extends: ['plugin:yasm/recommended'],
+> };
+> ```
+>
+> This gives you exact optional protection scoped directly to YASM updaters without breaking third-party UI component libraries.
+>
+> ---
+>
+> ### Recommended State Design
+>
+> When a field can intentionally have "no value", prefer a required property with an explicit `null` value:
 >
 > ```ts
 > type UserState = {
@@ -350,7 +400,7 @@ The setter cache is keyed by the updater function — and YASM keeps the updater
 >     selectedId?: string;
 > };
 > ```
-
+>
 > or:
 >
 > ```ts
@@ -360,7 +410,7 @@ The setter cache is keyed by the updater function — and YASM keeps the updater
 > };
 > ```
 >
-> This makes the state invariant explicit: the property always exists, and its “empty” value is `null`, never `undefined`.
+> This makes the state invariant explicit: the property always exists, and its "empty" value is `null`, never `undefined`.
 >
 > Do not use `age?: number | null` as a substitute. With `exactOptionalPropertyTypes` disabled, that still permits an explicit `undefined`.
 >
@@ -374,11 +424,11 @@ The setter cache is keyed by the updater function — and YASM keeps the updater
 >
 > instead of having to account for both `null` and `undefined`.
 >
-> #### Important limitation
+> ### Important Limitation
 >
 > Using `null` does not completely replace `exactOptionalPropertyTypes`.
 >
-> YASM's partial payloads still intentionally use optional properties:
+> YASM's partial payloads intentionally use optional properties:
 >
 > ```ts
 > updateState({ age: 42 });
@@ -401,10 +451,10 @@ The setter cache is keyed by the updater function — and YASM keeps the updater
 >
 > Therefore:
 >
-> * Prefer required `T | null` properties in YASM state when “no value” is meaningful.
+> * Use [`eslint-plugin-yasm`](https://github.com/Hasan-Mir/eslint-plugin-yasm) to catch invalid `undefined` assignments at lint time.
+> * Prefer required `T | null` properties in YASM state when "no value" is meaningful.
 > * Avoid using `undefined` as a valid state value unless it is explicitly part of the state model.
-> * Do not rely on `null` alone as a complete replacement for `exactOptionalPropertyTypes`.
-> * If your project can safely enable `exactOptionalPropertyTypes`, it remains the strongest compile-time protection for YASM's optional/partial APIs.
+> * If your project can safely enable `exactOptionalPropertyTypes`, it remains the strongest native compile-time protection.
 >
 > When `undefined` can enter state through external data, migrations, persistence, or other untyped boundaries, normalize or validate that data before it becomes application state.
 
