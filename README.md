@@ -43,7 +43,6 @@ import {
     createStore,
     YasmContext,
     useYasmState,
-    usePurgeYasmState,
     mergeUpdaterGenerator,
     type Section
 } from '@mrnafisia/yasm';
@@ -541,7 +540,7 @@ store.subscribe(
 );
 ```
 
-- The selector is evaluated whenever `(name, path)` is notified (update or purge), memoized, and re-fired **only when the selection actually changed**:
+- The selector is evaluated whenever `(name, path)` is updated, memoized, and re-fired **only when the selection actually changed**:
   - `'shallow'` (default) — `Object.is`, falling back to a top-level key-by-key comparison. A selector that rebuilds its result object on every call does **not** re-fire when every top-level value is unchanged.
   - `'strict'` — `Object.is` only (a fresh object identity always re-fires).
   - custom — `(prev, next) => boolean`, giving you full control (e.g. compare a **parity** or a sorted key instead of the raw value).
@@ -788,7 +787,7 @@ const changeMode = (nextMode: Mode) => {
 
 #### Recipe: freeing per-row state when rows leave the data
 
-Rows typically keep state at `${basePath}/${rowID}/...`. Derive purges from **data** (the id list), never from component lifecycle — pagination unmounts rows whose state must survive. A minimal reconciliation hook (a production-grade version ships in [`examples/usePurgeRemovedRows.ts`](./examples/usePurgeRemovedRows.ts)):
+Rows typically keep state at `${basePath}/${rowID}/...`. Derive purges from **data** (the id list), never from component lifecycle — pagination unmounts rows whose state must survive. A minimal reconciliation hook:
 
 ```tsx
 const usePurgeRemovedRows = (
@@ -908,10 +907,9 @@ Optimistic UI updates mutate the store **before** the API call settles. When the
 const rollback = store.captureRollback('UserRow', '/users[7]');
 
 // 2. Apply the optimistic patch
-updateRow(path, { saving: true });
-await saveRowRemote({ ... });
+updateRow({ saving: true });
 
-// 3. On rejection — restore in one call:
+// 3. Dispatch remote call and restore on rejection:
 try {
     await saveRowRemote({ ... });
 } catch (error) {
@@ -1152,22 +1150,28 @@ export const StoreProvider = ({ children }: { children: ReactNode }) => {
 
 ### Gating on Hydration: `useHydration`
 
-The boilerplate `ready` state + `useEffect(() => { store.hydrate().finally(...) }, [])` collapses into one reactive hook. `useHydration` is driven by `useSyncExternalStore` over the store's **hydration status**, so the component re-renders the moment the status transitions:
+The manual `ready` state, `.catch()`, and `.finally(...)` promise boilerplate collapses into one reactive hook. `useHydration` is driven by `useSyncExternalStore` over the store's **hydration status**, so the component re-renders automatically as the status transitions. You only need to trigger `store.hydrate()` once:
 
 ```tsx
-import { ReactNode } from 'react';
+import { ReactNode, useEffect } from 'react';
 import { useHydration, YasmContext } from '@mrnafisia/yasm';
 import { store } from './store';
 
-// Option 1: Pass the store explicitly when calling useHydration at the root provider level
 const StoreProvider = ({ children }: { children: ReactNode }) => {
-    const { status } = useHydration(store);
+    // const { status } = useHydration(); // ❌ Throws: Provider is rendered below, context not yet available
+    const { status } = useHydration(store); // ✅ Safe: pass store explicitly when above Provider
+
+    // store.hydrate() must be triggered explicitly; otherwise status stays 
+    // 'idle' forever and the splash screen never resolves
+    useEffect(() => {
+        store.hydrate();
+    }, []);
 
     return (
         <YasmContext.Provider value={store}>
             {status === 'hydrated' || status === 'quarantined'
                 ? children
-                : <SplashScreen status={status}/>}
+                : <SplashScreen status={status} />}
         </YasmContext.Provider>
     );
 };
@@ -1177,24 +1181,30 @@ const StoreProvider = ({ children }: { children: ReactNode }) => {
 > By default, `useHydration()` reads the store from React context (`useContext(YasmContext)`).
 > If you invoke `useHydration()` without arguments **inside the very component that renders `<YasmContext.Provider>`**, it will throw an error:
 > ```text
-> YASM: no store was found in the React context. Wrap your component tree in <YasmContext.Provider value="{store}"> or pass the store explicitly to useHydration(store).
+> YASM: no store was found in the React context. Wrap your component tree in <YasmContext.Provider value={store}> or pass the store explicitly to useHydration(store).
 > ```
 > To avoid this, either:
 > 1. Pass the store explicitly: `useHydration(store)` (as shown in the example above).
 > 2. Or split your tree and call `useHydration()` inside a child component rendered beneath `<YasmContext.Provider>`:
 >
 > ```tsx
-> const StoreProvider = ({ children }: { children: ReactNode }) => (
->     <YasmContext.Provider value="{store}">
->         <HydrationGate>{children}</HydrationGate>
->     </YasmContext.Provider>
-> );
+> const StoreProvider = ({ children }: { children: ReactNode }) => {
+>     useEffect(() => {
+>         store.hydrate(); // Trigger hydration once at the root
+>     }, []);
+> 
+>     return (
+>         <YasmContext.Provider value={store}>
+>             <HydrationGate>{children}</HydrationGate>
+>         </YasmContext.Provider>
+>     );
+> };
 >
 > const HydrationGate = ({ children }: { children: ReactNode }) => {
 >     const { status } = useHydration(); // ✅ Safe: reads store from parent YasmContext.Provider
 >     return status === 'hydrated' || status === 'quarantined'
 >         ? <>{children}</>
->         : <SplashScreen status="{status}"/>;
+>         : <SplashScreen status={status} />;
 > };
 > ```
 
@@ -1287,7 +1297,7 @@ type QuarantineInfo = {
 };
 ```
 
-`onQuarantine` may be synchronous or asynchronous and is **isolated** — if it throws, YASM logs the failure, completes the quarantine reset, and hydration still resolves. Hydration also lands on the `'quarantined'` status (see `useHydration` below), so you can react in the store as well as the app layer.
+`onQuarantine` may be synchronous or asynchronous and is **isolated** — if it throws, YASM logs the failure, completes the quarantine reset, and hydration still resolves. Hydration also lands on the `'quarantined'` status (see `useHydration` above), so you can react in the store as well as the app layer.
 
 ### Manual Save & Autosave
 
@@ -1756,7 +1766,8 @@ const useValueState = <T>(path: string, initial: T) => {
               path: string;
               payload: unknown;
           }
-        | { type: 'purge'; pathPrefix: string };
+        | { type: 'purge'; pathPrefix: string }
+        | { type: 'clone'; sourcePrefix: string; targetPrefix: string };
     ```
 
     For example, log only updates of one section and purges under one tab:
@@ -1767,7 +1778,7 @@ const useValueState = <T>(path: string, initial: T) => {
             logStateUpdates: event =>
                 event.type === 'purge'
                     ? event.pathPrefix.startsWith('/tabs')
-                    : event.sectionName === 'TransactionTable'
+                    : event.type === 'update' && event.sectionName === 'TransactionTable'
         }
     });
     ```
@@ -1819,6 +1830,7 @@ const useValueState = <T>(path: string, initial: T) => {
 | `useYasmState(name, path, selectorOrOptions?)`    | hook     | Returns `[state, updater]`. Options: `selector`, `overrideInitialState`.                                                                                                          |
 | `useYasmStateUpdater(name, path)`                 | hook     | Write-only access: returns just the updater; never subscribes or re-renders.                                                                                                      |
 | `store.subscribe(cb \| name, path, …)`            | method   | Raw `(callback, name, path)` for `useSyncExternalStore`, or selector-aware `(name, path, selector, listener, options?)` with `equality` (`'shallow'`/`'strict'`/custom) and `fireImmediately`. |
+| `store.subscribeMany(targets, listener, options?)` | method   | Watches multiple `(section, path)` targets with one listener and one unsubscribe; batches changes per microtask.                                                                  |
 | `usePurgeYasmState()`                             | hook     | Returns `purge(pathPrefix \| pathPrefix[], options?)`.                                                                                                                            |
 | `usePurgeWhenUnused()`                            | hook     | Lifecycle-safe purge: fires when the last matching subscriber leaves (or immediately if none). Accepts one prefix or an array of prefixes.                                        |
 | `purgeYasmState(store, path, options?)`           | function | Pure purge — usable outside React. `path` is a prefix or an array of prefixes.                                                                                                    |
